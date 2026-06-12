@@ -107,8 +107,6 @@ def get_formats(url: str) -> list[dict]:
     extra = ytdlp_base_args(url)
     stdout, stderr, code = run_ytdlp(extra + ["-J", "--no-playlist", url])
     if code != 0:
-        # Produce a clean, readable error
-        # Strip WARNING lines so only the real ERROR shows
         errors = [l for l in stderr.splitlines() if l.startswith("ERROR")]
         msg = "\n".join(errors) if errors else stderr.strip()
         raise RuntimeError(msg or "yt-dlp failed (no output)")
@@ -116,8 +114,13 @@ def get_formats(url: str) -> list[dict]:
     info = json.loads(stdout)
     formats_raw = info.get("formats", [])
 
-    seen_labels: set[str] = set()
-    formats: list[dict] = []
+    # Collect ALL video format IDs per (height, fps) bucket so we can build
+    # a fallback chain: "137+bestaudio/396+bestaudio/best".
+    # This avoids "Requested format is not available" when a specific ID is
+    # DASH-only or geo-restricted.
+    from collections import defaultdict
+    buckets: dict[str, dict] = {}          # label -> metadata
+    bucket_ids: dict[str, list[str]] = defaultdict(list)  # label -> [fid, ...]
 
     for f in formats_raw:
         vcodec = f.get("vcodec", "none")
@@ -128,26 +131,30 @@ def get_formats(url: str) -> list[dict]:
             continue
 
         fps      = f.get("fps") or 0
-        ext      = f.get("ext", "mp4")
         fid      = f.get("format_id", "")
         filesize = f.get("filesize") or f.get("filesize_approx") or 0
 
         fps_str = f"+{int(fps)}fps" if fps and fps > 30 else ""
         label   = f"{height}p{fps_str}"
 
-        if label in seen_labels:
-            continue
-        seen_labels.add(label)
+        bucket_ids[label].append(fid)
+        if label not in buckets:
+            buckets[label] = {
+                "ext": f.get("ext", "mp4"),
+                "height": height,
+                "fps": fps,
+                "vcodec": vcodec,
+                "filesize": filesize,
+                "label": label,
+            }
 
-        formats.append({
-            "format_id": fid,
-            "ext": ext,
-            "height": height,
-            "fps": fps,
-            "vcodec": vcodec,
-            "filesize": filesize,
-            "label": label,
-        })
+    formats: list[dict] = []
+    for label, ids in bucket_ids.items():
+        meta = buckets[label]
+        # Build fallback chain: "(id1/id2/...)+bestaudio/best"
+        video_chain = "/".join(ids)
+        format_id   = f"{video_chain}+bestaudio/best"
+        formats.append({**meta, "format_id": format_id})
 
     formats.sort(key=lambda x: (x["height"], x["fps"]), reverse=True)
     formats.insert(0, {
@@ -160,14 +167,22 @@ def get_formats(url: str) -> list[dict]:
     return formats
 
 
-def build_keyboard(formats: list[dict], url_key: str) -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton(fmt["label"], callback_data=f"dl|{url_key}|{fmt['format_id']}")]
-        for fmt in formats
-    ]
+def build_keyboard(formats: list[dict], url_key: str, ctx_user_data: dict) -> InlineKeyboardMarkup:
+    # Store format chains in user_data keyed by short index to stay within
+    # Telegram's 64-byte callback_data limit.
+    fmt_store: dict[str, str] = {}
+    buttons = []
+    for i, fmt in enumerate(formats):
+        idx = str(i)
+        fmt_store[idx] = fmt["format_id"]
+        buttons.append([InlineKeyboardButton(
+            fmt["label"], callback_data=f"dl|{url_key}|{idx}"
+        )])
+    fmt_store["a"] = "bestaudio"
     buttons.append([InlineKeyboardButton(
-        "🎵 Audio only (best)", callback_data=f"dl|{url_key}|bestaudio"
+        "\U0001f3b5 Audio only (best)", callback_data=f"dl|{url_key}|a"
     )])
+    ctx_user_data[f"{url_key}_fmts"] = fmt_store
     return InlineKeyboardMarkup(buttons)
 
 
@@ -237,7 +252,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data[url_key] = url
     await status_msg.edit_text(
         f"📺 *{site}* — choose quality:\n_(audio always at best quality)_",
-        reply_markup=build_keyboard(formats, url_key),
+        reply_markup=build_keyboard(formats, url_key, ctx.user_data),
         parse_mode="Markdown",
     )
 
@@ -246,21 +261,24 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     query = update.callback_query
     await query.answer()
 
-    _, url_key, format_id = query.data.split("|", 2)
+    _, url_key, fmt_idx = query.data.split("|", 2)
     url = ctx.user_data.get(url_key)
+    fmt_store = ctx.user_data.get(f"{url_key}_fmts", {})
     if not url:
         await query.edit_message_text("❌ Session expired. Please send the URL again.")
         return
+
+    # Resolve short index → full format chain stored in user_data
+    format_id = fmt_store.get(fmt_idx, fmt_idx)
 
     await query.edit_message_text("⬇️ Downloading… please wait.")
 
     is_audio_only = format_id == "bestaudio"
     if is_audio_only:
         fmt_arg = "bestaudio/best"
-    elif "+" in format_id or format_id.startswith("best"):
-        fmt_arg = format_id
     else:
-        fmt_arg = f"{format_id}+bestaudio/best"
+        # format_id is the full fallback chain, e.g. "137/396+bestaudio/best"
+        fmt_arg = format_id
 
     output_template = str(DOWNLOAD_DIR / f"{url_key}_%(title).60s.%(ext)s")
     extra    = ytdlp_base_args(url)
@@ -318,6 +336,7 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     finally:
         filepath.unlink(missing_ok=True)
         ctx.user_data.pop(url_key, None)
+        ctx.user_data.pop(f"{url_key}_fmts", None)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
