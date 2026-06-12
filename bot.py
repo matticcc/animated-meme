@@ -152,8 +152,12 @@ def get_formats(url: str) -> list[dict]:
     for label, ids in bucket_ids.items():
         meta = buckets[label]
         # Build fallback chain: "(id1/id2/...)+bestaudio/best"
-        video_chain = "/".join(ids)
-        format_id   = f"{video_chain}+bestaudio/best"
+        # Each ID must be paired with +bestaudio individually.
+        # "137/396+bestaudio/best" is WRONG: yt-dlp would pick bare "137"
+        # (video-only) and succeed without audio.
+        # "137+bestaudio/396+bestaudio/best" is correct: tries each
+        # video+audio pair in order, falls back to yt-dlp's own best.
+        format_id = "/".join(f"{fid}+bestaudio" for fid in ids) + "/best"
         formats.append({**meta, "format_id": format_id})
 
     formats.sort(key=lambda x: (x["height"], x["fps"]), reverse=True)
