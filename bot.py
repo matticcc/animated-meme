@@ -29,7 +29,7 @@ _RENDER_COOKIES  = Path("/etc/secrets/youtube_cookies.txt")
 # Writable fallback used when you upload via /setcookies
 _RUNTIME_COOKIES = DOWNLOAD_DIR / "youtube_cookies.txt"
 
-MAX_FILESIZE_MB    = 50
+MAX_FILESIZE_MB    = 500
 TELEGRAM_MAX_BYTES = MAX_FILESIZE_MB * 1024 * 1024
 
 KNOWN_SITES: dict[str, str] = {
