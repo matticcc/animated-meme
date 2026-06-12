@@ -1,0 +1,9 @@
+services:
+  - type: web                      # "web" keeps it on the free tier
+    name: ytdlp-telegram-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free                     # upgrade to "starter" ($7/mo) to avoid spin-down
+    envVars:
+      - key: BOT_TOKEN
+        sync: false                # you'll paste the value in the Render dashboard

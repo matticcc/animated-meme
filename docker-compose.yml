@@ -1,0 +1,8 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+    volumes:
+      - /tmp/ytdlp_bot:/tmp/ytdlp_bot   # ephemeral download scratch space
