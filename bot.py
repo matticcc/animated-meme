@@ -19,12 +19,15 @@ from telegram.ext import (
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-PORT = int(os.environ.get("PORT", "10000"))   # Render injects $PORT
+BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
+PORT         = int(os.environ.get("PORT", "10000"))
 DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "ytdlp_bot"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-MAX_FILESIZE_MB = 50
+# Cookies file dropped in at build time via Render Secret File (see README)
+COOKIES_FILE = Path("/etc/secrets/youtube_cookies.txt")
+
+MAX_FILESIZE_MB    = 50
 TELEGRAM_MAX_BYTES = MAX_FILESIZE_MB * 1024 * 1024
 
 KNOWN_SITES: dict[str, str] = {
@@ -43,8 +46,10 @@ KNOWN_SITES: dict[str, str] = {
     "rumble.com": "Rumble",
 }
 
+YOUTUBE_DOMAINS = {"youtube.com", "youtu.be"}
 
-# ── Tiny health-check server (required by Render Web Service) ─────────────────
+
+# ── Health-check server (Render requires an open port) ───────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -52,12 +57,11 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def log_message(self, *args):
-        pass  # silence access logs
+        pass
 
 
 def run_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -70,23 +74,44 @@ def detect_site(url: str) -> str:
     return "Unknown site"
 
 
+def is_youtube(url: str) -> bool:
+    url_lower = url.lower()
+    return any(d in url_lower for d in YOUTUBE_DOMAINS)
+
+
 def extract_url(text: str) -> str | None:
-    match = re.search(r"https?://[^\s]+", text)
-    return match.group(0) if match else None
+    m = re.search(r"https?://[^\s]+", text)
+    return m.group(0) if m else None
+
+
+def ytdlp_base_args(url: str) -> list[str]:
+    """Common extra args injected for every yt-dlp call."""
+    args: list[str] = []
+    # Always use deno JS runtime (installed in Dockerfile)
+    args += ["--js-runtimes", "deno"]
+    # Inject cookies for YouTube if the secret file exists
+    if is_youtube(url) and COOKIES_FILE.exists():
+        args += ["--cookies", str(COOKIES_FILE)]
+    return args
 
 
 def run_ytdlp(args: list[str]) -> tuple[str, str, int]:
     result = subprocess.run(
         ["yt-dlp"] + args,
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=180,
     )
     return result.stdout, result.stderr, result.returncode
 
 
 def get_formats(url: str) -> list[dict]:
-    stdout, stderr, code = run_ytdlp(["-J", "--no-playlist", url])
+    extra = ytdlp_base_args(url)
+    stdout, stderr, code = run_ytdlp(extra + ["-J", "--no-playlist", url])
     if code != 0:
-        raise RuntimeError(stderr.strip() or "yt-dlp failed to fetch info")
+        # Produce a clean, readable error
+        # Strip WARNING lines so only the real ERROR shows
+        errors = [l for l in stderr.splitlines() if l.startswith("ERROR")]
+        msg = "\n".join(errors) if errors else stderr.strip()
+        raise RuntimeError(msg or "yt-dlp failed (no output)")
 
     info = json.loads(stdout)
     formats_raw = info.get("formats", [])
@@ -102,13 +127,13 @@ def get_formats(url: str) -> list[dict]:
         if not height:
             continue
 
-        fps = f.get("fps") or 0
-        ext = f.get("ext", "mp4")
-        fid = f.get("format_id", "")
+        fps      = f.get("fps") or 0
+        ext      = f.get("ext", "mp4")
+        fid      = f.get("format_id", "")
         filesize = f.get("filesize") or f.get("filesize_approx") or 0
 
         fps_str = f"+{int(fps)}fps" if fps and fps > 30 else ""
-        label = f"{height}p{fps_str}"
+        label   = f"{height}p{fps_str}"
 
         if label in seen_labels:
             continue
@@ -136,37 +161,61 @@ def get_formats(url: str) -> list[dict]:
 
 
 def build_keyboard(formats: list[dict], url_key: str) -> InlineKeyboardMarkup:
-    buttons = []
-    for fmt in formats:
-        callback = f"dl|{url_key}|{fmt['format_id']}"
-        buttons.append([InlineKeyboardButton(fmt["label"], callback_data=callback)])
+    buttons = [
+        [InlineKeyboardButton(fmt["label"], callback_data=f"dl|{url_key}|{fmt['format_id']}")]
+        for fmt in formats
+    ]
     buttons.append([InlineKeyboardButton(
         "🎵 Audio only (best)", callback_data=f"dl|{url_key}|bestaudio"
     )])
     return InlineKeyboardMarkup(buttons)
 
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
+# ── Telegram handlers ─────────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    cookies_status = "✅ YouTube cookies loaded" if COOKIES_FILE.exists() \
+                     else "⚠️ No YouTube cookies — use /setcookies if YouTube fails"
     await update.message.reply_text(
         "👋 *Welcome!*\n\n"
         "Send me any video URL (YouTube, TikTok, Instagram, Twitter, Vimeo…) "
-        "and I'll let you pick the quality before downloading.\n\n"
+        "and I'll let you pick the quality.\n\n"
         "🎵 Audio is always merged at best quality.\n"
-        f"⚠️ Max file size: {MAX_FILESIZE_MB} MB (Telegram limit).",
+        f"⚠️ Max file size: {MAX_FILESIZE_MB} MB\n\n"
+        f"{cookies_status}",
         parse_mode="Markdown",
     )
 
 
+async def handle_setcookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Let the bot owner upload a cookies.txt at runtime as a fallback.
+    Usage: reply to a .txt document with /setcookies
+    """
+    msg = update.message
+    if msg.document and msg.document.file_name.endswith(".txt"):
+        file = await msg.document.get_file()
+        await file.download_to_drive(str(COOKIES_FILE))
+        await msg.reply_text("✅ Cookies saved! YouTube should work now.")
+    else:
+        await msg.reply_text(
+            "Send a `cookies.txt` file *as a document* and reply to it with `/setcookies`.\n\n"
+            "Export cookies with the *Get cookies.txt LOCALLY* Chrome extension:\n"
+            "1. Log in to YouTube in Chrome\n"
+            "2. Click the extension on youtube.com\n"
+            "3. Export → send the file here",
+            parse_mode="Markdown",
+        )
+
+
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or ""
-    url = extract_url(text)
+    url  = extract_url(text)
     if not url:
         await update.message.reply_text("❌ I couldn't find a URL in your message.")
         return
 
-    site = detect_site(url)
+    site       = detect_site(url)
     status_msg = await update.message.reply_text(
         f"🔍 Fetching quality options from *{site}*…", parse_mode="Markdown"
     )
@@ -174,15 +223,21 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         formats = await asyncio.get_event_loop().run_in_executor(None, get_formats, url)
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error fetching formats:\n`{e}`", parse_mode="Markdown")
+        err = str(e)
+        hint = ""
+        if "Sign in to confirm" in err or "bot" in err.lower():
+            hint = "\n\n💡 YouTube is blocking server IPs. Send your `cookies.txt` with `/setcookies`."
+        await status_msg.edit_text(
+            f"❌ *Error fetching formats:*\n`{err}`{hint}",
+            parse_mode="Markdown",
+        )
         return
 
-    url_key = str(status_msg.message_id)
+    url_key              = str(status_msg.message_id)
     ctx.user_data[url_key] = url
-    keyboard = build_keyboard(formats, url_key)
     await status_msg.edit_text(
         f"📺 *{site}* — choose quality:\n_(audio always at best quality)_",
-        reply_markup=keyboard,
+        reply_markup=build_keyboard(formats, url_key),
         parse_mode="Markdown",
     )
 
@@ -199,16 +254,17 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
     await query.edit_message_text("⬇️ Downloading… please wait.")
 
-    if format_id == "bestaudio":
+    is_audio_only = format_id == "bestaudio"
+    if is_audio_only:
         fmt_arg = "bestaudio/best"
-        is_audio_only = True
+    elif "+" in format_id or format_id.startswith("best"):
+        fmt_arg = format_id
     else:
-        fmt_arg = format_id if ("+" in format_id or format_id.startswith("best")) \
-                  else f"{format_id}+bestaudio/best"
-        is_audio_only = False
+        fmt_arg = f"{format_id}+bestaudio/best"
 
     output_template = str(DOWNLOAD_DIR / f"{url_key}_%(title).60s.%(ext)s")
-    ydl_args = [
+    extra    = ytdlp_base_args(url)
+    ydl_args = extra + [
         "-f", fmt_arg,
         "--merge-output-format", "mp3" if is_audio_only else "mp4",
         "--no-playlist", "--no-warnings",
@@ -219,13 +275,20 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         ydl_args += ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"]
 
     try:
-        stdout, stderr, code = await asyncio.get_event_loop().run_in_executor(
+        _, stderr, code = await asyncio.get_event_loop().run_in_executor(
             None, lambda: run_ytdlp(ydl_args)
         )
         if code != 0:
-            raise RuntimeError(stderr.strip() or "Download failed")
+            errors = [l for l in stderr.splitlines() if l.startswith("ERROR")]
+            raise RuntimeError("\n".join(errors) if errors else stderr.strip())
     except Exception as e:
-        await query.edit_message_text(f"❌ Download error:\n`{e}`", parse_mode="Markdown")
+        err  = str(e)
+        hint = ""
+        if "Sign in to confirm" in err or "bot" in err.lower():
+            hint = "\n\n💡 Use `/setcookies` to upload your YouTube cookies."
+        await query.edit_message_text(
+            f"❌ *Download error:*\n`{err}`{hint}", parse_mode="Markdown"
+        )
         return
 
     files = list(DOWNLOAD_DIR.glob(f"{url_key}_*"))
@@ -236,10 +299,8 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     filepath = files[0]
     if filepath.stat().st_size > TELEGRAM_MAX_BYTES:
         filepath.unlink(missing_ok=True)
-        size_mb = filepath.stat().st_size // (1024 * 1024) if filepath.exists() else "?"
         await query.edit_message_text(
-            f"❌ File is too large. Telegram bots can only send up to {MAX_FILESIZE_MB} MB.\n"
-            "Try a lower quality."
+            f"❌ File too large for Telegram (>{MAX_FILESIZE_MB} MB). Try a lower quality."
         )
         return
 
@@ -265,15 +326,23 @@ def main() -> None:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN environment variable is not set")
 
-    # Start health-check server in a background thread
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
-    print(f"✅ Health server listening on port {PORT}")
+    threading.Thread(target=run_health_server, daemon=True).start()
+    print(f"✅ Health server on port {PORT}")
+    if COOKIES_FILE.exists():
+        print(f"✅ YouTube cookies loaded from {COOKIES_FILE}")
+    else:
+        print("⚠️  No YouTube cookies file found — YouTube may fail on server IPs")
 
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(CommandHandler("start",      start))
+    app.add_handler(CommandHandler("help",       start))
+    app.add_handler(CommandHandler("setcookies", handle_setcookies))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, handle_url
+    ))
+    app.add_handler(MessageHandler(
+        filters.Document.MimeType("text/plain"), handle_setcookies
+    ))
     app.add_handler(CallbackQueryHandler(handle_download, pattern=r"^dl\|"))
 
     print("🤖 Bot polling…")
