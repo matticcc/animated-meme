@@ -33,7 +33,7 @@ _RENDER_COOKIES = Path("/etc/secrets/youtube_cookies.txt")
 _RUNTIME_COOKIES = DOWNLOAD_DIR / "youtube_cookies.txt"
 
 MAX_FILESIZE_MB = 500
-TELEGRAM_MAX_BYTES = 150 * 1024 * 1024  # 50MB strict limit
+TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50MB strict limit
 
 KNOWN_SITES: dict[str, str] = {
     "tiktok.com":  "TikTok",
@@ -235,6 +235,90 @@ def fetch_instagram_public(url: str, url_key: str) -> list[Path] | None:
         return None
 
 
+def is_instagram_story_url(url: str) -> bool:
+    """Return True for any Instagram Stories or Highlights URL."""
+    low = url.lower()
+    return "instagram.com" in low and (
+        "/stories/" in low or
+        "/s/" in low or          # short share links for stories
+        "highlight:" in low      # highlight reel links
+    )
+
+
+def fetch_instagram_stories(url: str, url_key: str) -> list[Path]:
+    """
+    Try to download Instagram Stories via yt-dlp (requires cookies for
+    private/own stories; public stories sometimes work without them).
+
+    Strategy:
+      1. Run yt-dlp -J to probe the story URL and get per-item entries.
+      2. Download each item with the best available format.
+      3. Return list of downloaded Paths.
+
+    Returns an empty list on any failure — caller should fall back to
+    the manual-paste DevTools flow.
+    """
+    cookies = get_cookies_path()
+
+    # Build base args tailored for Instagram stories
+    args = [
+        "--no-warnings",
+        "--rm-cache-dir",
+        "--no-cache-dir",
+        "--user-agent",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+        "Mobile/15E148 Safari/604.1",
+        "--add-header", "X-Ig-App-Id:936619743392459",
+        "--socket-timeout", "20",
+    ]
+    if cookies:
+        args += ["--cookies", str(cookies)]
+
+    # Probe first so we know how many items to expect
+    stdout, stderr, code = run_ytdlp(args + ["-J", "--flat-playlist", url])
+    if code != 0:
+        return []
+
+    try:
+        info = json.loads(stdout)
+    except Exception:
+        return []
+
+    entries = info.get("entries") or ([info] if info.get("id") else [])
+    if not entries:
+        return []
+
+    downloaded: list[Path] = []
+    for idx, entry in enumerate(entries):
+        entry_url = entry.get("url") or entry.get("webpage_url")
+        if not entry_url:
+            # Some entries only carry an id — reconstruct a usable story URL
+            entry_id = entry.get("id", "")
+            if entry_id:
+                entry_url = f"https://www.instagram.com/stories/item/{entry_id}/"
+            else:
+                continue
+
+        out_tpl = str(DOWNLOAD_DIR / f"{url_key}_{idx:03d}.%(ext)s")
+        dl_args = args + [
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+            "--merge-output-format", "mp4",
+            "--no-playlist",
+            "-o", out_tpl,
+            entry_url,
+        ]
+        _, _, dl_code = run_ytdlp(dl_args)
+        if dl_code == 0:
+            # Find what was actually written (ext may vary)
+            for p in DOWNLOAD_DIR.glob(f"{url_key}_{idx:03d}.*"):
+                if not p.name.endswith((".part", ".ytdl")):
+                    downloaded.append(p)
+                    break
+
+    return downloaded
+
+
 def get_instagram_graphql_instructions(url: str) -> tuple[str | None, bool]:
     """
     Returns (graphql_api_url_for_manual_paste, is_story).
@@ -243,7 +327,7 @@ def get_instagram_graphql_instructions(url: str) -> tuple[str | None, bool]:
     """
     import urllib.request as _req
 
-    if "/stories/" in url.lower():
+    if is_instagram_story_url(url):
         return None, True
     match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
     if not match:
@@ -531,7 +615,7 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data[url_key] = {"url": url, "is_raw": False}
 
         # Try direct fetch first (works for public posts without any manual steps)
-        if "/stories/" not in url.lower():
+        if not is_instagram_story_url(url):
             files = await asyncio.get_event_loop().run_in_executor(
                 None, fetch_instagram_public, url, url_key
             )
@@ -564,24 +648,73 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 if files:
                     return
 
-        # Direct fetch failed or it's a story — fall back to manual GraphQL paste flow
-        api_url, is_story = get_instagram_graphql_instructions(url)
-        if is_story:
+        # ── Stories: try automatic yt-dlp download first ──────────────────────
+        if is_instagram_story_url(url):
+            await msg.edit_text("👻 Attempting automatic Story download...")
+            story_files = await asyncio.get_event_loop().run_in_executor(
+                None, fetch_instagram_stories, url, url_key
+            )
+            if story_files:
+                images = [f for f in story_files if f.suffix.lower() in IMAGE_EXTS]
+                videos = [f for f in story_files if f.suffix.lower() not in IMAGE_EXTS]
+                total = len(story_files)
+                if total == 1:
+                    await msg.edit_text("📤 Uploading story item...")
+                    target = story_files[0]
+                    try:
+                        if target.suffix.lower() in IMAGE_EXTS:
+                            with open(target, "rb") as fh:
+                                await msg.reply_photo(photo=fh)
+                        else:
+                            if target.stat().st_size > TELEGRAM_MAX_BYTES:
+                                dl_url = generate_download_link(target)
+                                await msg.edit_text(
+                                    f"📦 Story video too large for Telegram.\n🔗 [Download directly]({dl_url})",
+                                    parse_mode="Markdown"
+                                )
+                                return
+                            with open(target, "rb") as fh:
+                                await msg.reply_video(video=fh, supports_streaming=True,
+                                                      read_timeout=600, write_timeout=600)
+                        await msg.delete()
+                        target.unlink(missing_ok=True)
+                    except Exception as e:
+                        await msg.edit_text(f"❌ Upload failed: {e}")
+                    return
+                # Multiple story items — build a simple picker
+                ctx.user_data[url_key] = {"files": [str(f) for f in story_files]}
+                label = (
+                    f"Found {len(images)} photo(s) and {len(videos)} video(s)"
+                    if images and videos else f"Found {total} story item(s)"
+                )
+                await msg.edit_text(
+                    f"👻 **Instagram Stories — {label}**",
+                    reply_markup=build_photo_picker(url_key, total),
+                    parse_mode="Markdown"
+                )
+                return
+            # Auto-download failed — fall through to manual paste instructions
             instructions = (
                 "👻 **Instagram Story Detected**\n\n"
-                "1. Open the Story in your browser layout view.\n"
-                "2. Press **F12** (Network tab), filter search for `reels_media` or `graphql`.\n"
-                "3. Refresh page (**Ctrl+R**), copy everything in the **Response** block.\n"
-                "4. **Paste or upload the JSON text block** directly into this chat stream."
+                "Automatic download failed (stories require a logged-in session).\n\n"
+                "**Manual steps:**\n"
+                "1. Open the Story in your browser and press **F12** → Network tab.\n"
+                "2. Filter requests by `reels_media` or `graphql`.\n"
+                "3. Refresh (**Ctrl+R**), then copy the full **Response** of the matching request.\n"
+                "4. **Paste or upload that JSON text** directly into this chat."
             )
-        else:
-            instructions = (
-                "🔒 **Private Instagram Post Detected**\n\n"
-                "Direct fetch didn't work — this post is likely private or rate-limited.\n\n"
-                f"1. Open this link: [GraphQL Payload]({api_url})\n"
-                "2. Select all text and copy (**Ctrl+A**, **Ctrl+C**).\n"
-                "3. **Paste or upload the text** right here in this chat stream."
-            )
+            await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
+            return
+
+        # ── Non-story private/rate-limited fallback ────────────────────────────
+        api_url, _ = get_instagram_graphql_instructions(url)
+        instructions = (
+            "🔒 **Private Instagram Post Detected**\n\n"
+            "Direct fetch didn't work — this post is likely private or rate-limited.\n\n"
+            f"1. Open this link: [GraphQL Payload]({api_url})\n"
+            "2. Select all text and copy (**Ctrl+A**, **Ctrl+C**).\n"
+            "3. **Paste or upload the text** right here in this chat stream."
+        )
         await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
         return
         
