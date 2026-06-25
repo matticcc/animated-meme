@@ -196,8 +196,7 @@ def is_tiktok_photo_url(url: str) -> bool:
 def fetch_instagram_public(url: str, url_key: str) -> list[Path] | None:
     """
     Download a public Instagram post (photo/reel/carousel) using yt-dlp
-    with the same cookies file as stories. No probe — just download and
-    collect whatever files land on disk.
+    with the same cookies file as stories.
     """
     cookies = get_cookies_path()
 
@@ -214,27 +213,27 @@ def fetch_instagram_public(url: str, url_key: str) -> list[Path] | None:
     if cookies:
         ig_args += ["--cookies", str(cookies)]
 
-    # Try as video first (covers reels and video posts)
+    def collected() -> list[Path]:
+        return [p for p in DOWNLOAD_DIR.glob(f"{url_key}_*")
+                if not p.name.endswith((".part", ".ytdl"))]
+
+    # Try video first (reels/video posts)
     out_vid = str(DOWNLOAD_DIR / f"{url_key}_%(title).60s.%(ext)s")
     fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
-    _, stderr_vid, code_vid = run_ytdlp(ig_args + [
+    run_ytdlp(ig_args + [
         "-f", fmt, "--merge-output-format", "mp4",
         "--format-sort", "ext:mp4:m4a",
         "-o", out_vid, url,
     ])
-    vid_files = [p for p in DOWNLOAD_DIR.glob(f"{url_key}_*")
-                 if not p.name.endswith((".part", ".ytdl"))]
+    files = collected()
+    if files:
+        return files
 
-    if vid_files:
-        return vid_files
-
-    # No video found — try as image/carousel
+    # No video — try image/carousel (ignores exit code, just check what landed)
     out_img = str(DOWNLOAD_DIR / f"{url_key}_%(autonumber)03d.%(ext)s")
-    _, _, code_img = run_ytdlp(ig_args + ["-o", out_img, url])
-    img_files = [p for p in DOWNLOAD_DIR.glob(f"{url_key}_*")
-                 if not p.name.endswith((".part", ".ytdl"))]
-
-    return img_files if img_files else None
+    run_ytdlp(ig_args + ["-o", out_img, url])
+    files = collected()
+    return files if files else None
 
 
 def is_instagram_story_url(url: str) -> bool:
