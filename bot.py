@@ -106,14 +106,14 @@ def base_args(url: str) -> list[str]:
 def run_ytdlp(args: list[str]) -> tuple[str, str, int]:
     result = subprocess.run(
         ["yt-dlp"] + args,
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=600,
     )
     return result.stdout, result.stderr, result.returncode
 
 def run_gallerydl(url: str, out_dir: Path) -> tuple[str, str, int]:
     result = subprocess.run(
         ["gallery-dl", "--dest", str(out_dir), url],
-        capture_output=True, text=True, timeout=45,
+        capture_output=True, text=True, timeout=120,
     )
     return result.stdout, result.stderr, result.returncode
 
@@ -306,7 +306,7 @@ def download_images(url: str, url_key: str) -> list[Path]:
 
     sub = DOWNLOAD_DIR / url_key
     sub.mkdir(exist_ok=True)
-    _, stderr, code = run_gallerydl(url, sub)
+    run_gallerydl(url, sub)
 
     gdl_files = sorted([
         p for p in sub.rglob("*")
@@ -407,7 +407,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = ""
-    is_file_payload = False
 
     if update.message.document:
         doc = update.message.document
@@ -417,7 +416,6 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 tg_file = await ctx.bot.get_file(doc.file_id)
                 file_bytes = await tg_file.download_as_bytearray()
                 text = file_bytes.decode("utf-8").strip()
-                is_file_payload = True
                 await msg.delete()
             except Exception as e:
                 await msg.edit_text(f"❌ Failed to process payload data: `{e}`")
@@ -429,7 +427,6 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         return
 
-    # Process JSON data payloads (Instagram GraphQL)
     if text.startswith("{") and ("xdt_api" in text or "shortcode_media" in text or '"data"' in text or "items" in text):
         msg = await update.message.reply_text("⚙ *Analyzing layout content...*", parse_mode="Markdown")
         url_key = str(msg.message_id)
@@ -464,7 +461,6 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text(f"🔍 Checking **{site}** link...", parse_mode="Markdown")
     url_key = str(msg.message_id)
 
-    # 1. Bypassing Probe for TikTok Photos to prevent gallery-dl hanging
     if is_tiktok_photo_url(url):
         await msg.edit_text("⬇️ Extracting photo gallery elements...")
         try:
@@ -487,7 +483,6 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # 2. Silent attempt block for other URLs
     try:
         info = await asyncio.get_event_loop().run_in_executor(None, probe_url, url)
     except Exception as e:
@@ -506,7 +501,6 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.edit_text(f"❌ *Scraping failure:* `{clean_errors(str(e))}`", parse_mode="Markdown")
         return
 
-    # 3. Handle Standard Image Posts (Non-TikTok Photo routes)
     if is_image_post(info):
         await msg.edit_text(f"⬇️ Downloading photos from *{site}*…", parse_mode="Markdown")
         try:
@@ -539,7 +533,6 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
         return
 
-    # 4. Handle Video Paths
     heights = get_available_heights(info)
     if "instagram.com" in url:
         ctx.user_data[url_key] = {"url": url, "is_raw": False}
@@ -560,6 +553,121 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=build_video_keyboard(url_key, heights),
         parse_mode="Markdown",
     )
+
+async def handle_photo_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    _, url_key, choice = query.data.split("|", 2)
+    data = ctx.user_data.get(url_key)
+    if not data:
+        await query.edit_message_text("❌ Session expired. Send the URL again.")
+        return
+
+    all_files = [Path(p) for p in data.get("files", [])]
+    all_files = [p for p in all_files if p.exists()]
+    if not all_files:
+        await query.edit_message_text("❌ Files no longer available. Send the URL again.")
+        return
+
+    if choice == "all":
+        selected = all_files
+    else:
+        idx = int(choice)
+        selected = [all_files[idx]] if idx < len(all_files) else all_files
+
+    await query.edit_message_text(f"📤 Uploading {len(selected)} photo(s)…")
+    try:
+        await send_photos(query.message, selected)
+        await query.delete_message()
+    except (TimedOut, NetworkError):
+        await query.edit_message_text("❌ Upload timed out. Please try again.")
+    except Exception as e:
+        await query.edit_message_text(f"❌ Upload error:\n`{e}`", parse_mode="Markdown")
+    finally:
+        if choice == "all" or len(all_files) <= 1:
+            for fp in all_files:
+                fp.unlink(missing_ok=True)
+            ctx.user_data.pop(url_key, None)
+
+async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    _, url_key, choice = query.data.split("|", 2)
+    data = ctx.user_data.get(url_key)
+    if not data:
+        await query.edit_message_text("❌ Session expired. Send the URL again.")
+        return
+
+    url     = data["url"]
+    presets = data.get("presets", [])
+
+    if choice == "audio":
+        fmt_arg, is_audio = "bestaudio/best", True
+    elif choice == "best":
+        fmt_arg, is_audio = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best", False
+    else:
+        idx = int(choice)
+        fmt_arg = presets[idx] if idx < len(presets) else "bestvideo+bestaudio/best"
+        is_audio = False
+
+    await query.edit_message_text("⬇️ Downloading… please wait.")
+
+    out = str(DOWNLOAD_DIR / f"{url_key}_%(title).60s.%(ext)s")
+    dl_args = base_args(url) + [
+        "-f", fmt_arg,
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "-o", out,
+        url,
+    ]
+    if is_audio:
+        dl_args += ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"]
+
+    try:
+        _, stderr, code = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: run_ytdlp(dl_args)
+        )
+        if code != 0:
+            raise RuntimeError(clean_errors(stderr))
+    except Exception as e:
+        await query.edit_message_text(f"❌ *Download error:*\n`{str(e)}`", parse_mode="Markdown")
+        return
+
+    filepath = await asyncio.get_event_loop().run_in_executor(None, find_downloaded_file, url_key)
+    if not filepath:
+        await query.edit_message_text("❌ File not found after download.")
+        return
+
+    size_bytes = filepath.stat().st_size
+    if size_bytes > TELEGRAM_MAX_BYTES:
+        filepath.unlink(missing_ok=True)
+        await query.edit_message_text(
+            f"❌ File too large ({size_bytes // 1024 // 1024} MB > {MAX_FILESIZE_MB} MB). Try a lower quality."
+        )
+        return
+
+    await query.edit_message_text("📤 Uploading to Telegram…")
+    try:
+        with open(filepath, "rb") as f:
+            if is_audio:
+                await query.message.reply_audio(audio=f, filename=filepath.name,
+                                                read_timeout=300, write_timeout=300, connect_timeout=60)
+            else:
+                await query.message.reply_video(video=f, filename=filepath.name,
+                                                supports_streaming=True,
+                                                read_timeout=300, write_timeout=300, connect_timeout=60)
+        await query.delete_message()
+    except (TimedOut, NetworkError):
+        await query.edit_message_text(
+            f"❌ Upload timed out ({size_bytes // 1024 // 1024} MB). Try a lower quality or retry."
+        )
+    except Exception as e:
+        await query.edit_message_text(f"❌ Upload error:\n`{e}`", parse_mode="Markdown")
+    finally:
+        filepath.unlink(missing_ok=True)
+        ctx.user_data.pop(url_key, None)
 
 async def handle_instagram_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -681,8 +789,6 @@ def main() -> None:
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help",  start))
-    
-    # Accept both documents (large txt payloads) and raw URLs
     app.add_handler(MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, handle_input))
     
     app.add_handler(CallbackQueryHandler(handle_download,         pattern=r"^dl\|"))
