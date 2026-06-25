@@ -358,22 +358,53 @@ async def handle_instagram_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             fp.unlink(missing_ok=True)
         ctx.user_data.pop(url_key, None)
         
-async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text.strip()
-    
-    if text.startswith("{") and ("xdt_api" in text or "shortcode_media" in text or '"data"' in text):
-        msg = await update.message.reply_text("⚙️ **Valid raw data layout matched.** parsing structure options...", parse_mode="Markdown")
+async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = ""
+    is_file_payload = False
+
+    # 1. Handle File/Document uploads (Telegram's auto-converted message.txt payload)
+    if update.message.document:
+        doc = update.message.document
+        if doc.file_name and doc.file_name.lower() in ["message.txt", "document.txt", "file.txt"] or doc.mime_type == "text/plain":
+            msg = await update.message.reply_text("📥 **Large file payload received.** Reading layout code...", parse_mode="Markdown")
+            try:
+                tg_file = await ctx.bot.get_file(doc.file_id)
+                # Read the file data directly into memory as bytes, then decode to string
+                file_bytes = await tg_file.download_as_bytearray()
+                text = file_bytes.decode("utf-8").strip()
+                is_file_payload = True
+                await msg.delete()
+            except Exception as e:
+                await msg.edit_text(f"❌ Failed to read document payload: `{e}`", parse_mode="Markdown")
+                return
+
+    # 2. Handle standard Text pastes
+    if not text and update.message.text:
+        text = update.message.text.strip()
+
+    if not text:
+        return
+
+    # 3. Check if the input is a raw JSON payload (either text paste or read from file)
+    if text.startswith("{") and ("xdt_api" in text or "shortcode_media" in text or '"data"' in text or "items" in text):
+        msg = await update.message.reply_text("⚙️ **Valid JSON structural payload matched.** Parsing options...", parse_mode="Markdown")
         url_key = str(msg.message_id)
         ctx.user_data[url_key] = {"raw_json": text, "is_raw": True}
+        
+        # Ask for delivery targets AFTER payload ingestion
         await msg.edit_text(
-            "🔒 **Private JSON Content Extracted**\nSelect media components to fetch from your browser session payload:",
+            "🔒 **Private Payload Ingested**\nSelect media components to parse and download:",
             reply_markup=build_instagram_carousel_keyboard(url_key),
             parse_mode="Markdown"
         )
         return
 
+    # 4. Process standard URL extractions
     url = extract_url(text)
     if not url:
+        # If it wasn't a valid JSON or a valid URL, ignore it
+        if is_file_payload:
+            await update.message.reply_text("❌ Uploaded file did not contain recognizable Instagram GraphQL data.")
         return
         
     if not is_allowed_site(url):
@@ -381,25 +412,35 @@ async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         return
         
     site = detect_site(url)
-    msg = await update.message.reply_text(f"🔍 Analyzing **{site}** content link...", parse_mode="Markdown")
+    msg = await update.message.reply_text(f"🔍 Analyzing **{site}** link...", parse_mode="Markdown")
     
-    if "instagram.com" in url:
-        url_key = str(msg.message_id)
-        ctx.user_data[url_key] = {"url": url, "is_raw": False}
-        await msg.edit_text(
-            f"📦 **{site} Media Formats Discovered**\nChoose how you want to handle this layout profile split:",
-            reply_markup=build_instagram_carousel_keyboard(url_key),
-            parse_mode="Markdown"
-        )
-        return
-
+    # Try automatic background analysis 
     try:
         info = await asyncio.get_event_loop().run_in_executor(None, probe_url, url)
     except Exception as e:
-        await msg.edit_text(f"❌ *Error:*\n`{clean_errors(str(e))}`", parse_mode="Markdown")
+        cleaned_err = clean_errors(str(e))
+        
+        # If background download fails AND it's Instagram, gracefully drop instructions
+        if "instagram.com" in url:
+            url_key = str(msg.message_id)
+            ctx.user_data[url_key] = {"url": url, "is_raw": False}
+            api_url = get_instagram_api_url(url)
+            
+            instructions = (
+                f"🔒 **Private Content Detected**\n"
+                f"Standard extraction failed. Follow these steps to fetch:\n\n"
+                f"1. Click and open this data link in your logged-in browser:\n`{api_url}`\n\n"
+                f"2. Copy **everything** you see on that page (Ctrl+A then Ctrl+C).\n"
+                f"3. **Paste/Upload that text block** back into this chat. (If it turns into a file, that's completely fine!)"
+            )
+            await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
+        else:
+            # Standard error message for non-Instagram services
+            await msg.edit_text(f"❌ *Error:*\n`{cleaned_err}`", parse_mode="Markdown")
         return
 
-    # Image-capable sites like TikTok /photo/ structures handler route
+    # 5. Handlers for SUCCESSFUL automatic background analysis
+    # Image-capable sites handler route (e.g., TikTok photos)
     if is_image_capable(url) and (info.get("_type") == "playlist" or "formats" not in info or not info.get("formats")):
         await msg.edit_text("⬇️ Extracting static media components...")
         url_key = str(msg.message_id)
@@ -428,8 +469,21 @@ async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
                 ctx.user_data.pop(url_key, None)
             return
 
+    # Direct Video flow logic (if public or cookies resolved it)
     url_key = str(msg.message_id)
     heights = get_available_heights(info)
+    
+    # If Instagram worked automatically, offer standard profile split controls
+    if "instagram.com" in url:
+        ctx.user_data[url_key] = {"url": url, "is_raw": False}
+        await msg.edit_text(
+            f"📦 **{site} Content Found**\nChoose extraction layout profile selection:",
+            reply_markup=build_instagram_carousel_keyboard(url_key),
+            parse_mode="Markdown"
+        )
+        return
+
+    # Fallback to normal preset selectors for YouTube, TikTok Video, Reddit, etc.
     preset_selectors = [
         selector for label, selector in QUALITY_PRESETS 
         if (m := re.search(r"height<=(\d+)", selector)) and any(h <= int(m.group(1)) for h in heights)
@@ -440,7 +494,6 @@ async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         reply_markup=build_video_keyboard(url_key, heights),
         parse_mode="Markdown",
     )
-
 # ... [Keep your imports, config, and helper functions identical] ...
 
 def get_instagram_api_url(url: str) -> str | None:
@@ -705,10 +758,11 @@ def main() -> None:
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     app.add_handler(CallbackQueryHandler(handle_download, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(handle_photo_pick, pattern=r"^pick\|"))
     app.add_handler(CallbackQueryHandler(handle_instagram_choice, pattern=r"^ig_choice\|"))
+    # Change the existing TEXT handler to include document attachments as well
+    app.add_handler(MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, handle_input))
     
     print("🤖 Bot online and ready...")
     app.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
