@@ -154,7 +154,7 @@ def find_downloaded_file(url_key: str) -> Path | None:
 def download_instagram_media_sync(url: str, url_key: str, choice: str = "all") -> list[Path]:
     out = str(DOWNLOAD_DIR / f"{url_key}_%(index)s.%(ext)s")
     
-    # Check if this is a direct GraphQL/Private query link dump
+    # ── FEATURE: Direct Private Raw Data GraphQL link Handling ──
     if "graphql/query" in url or "doc_id=" in url:
         try:
             headers = {
@@ -165,28 +165,57 @@ def download_instagram_media_sync(url: str, url_key: str, choice: str = "all") -
             with urllib.request.urlopen(req, timeout=15) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             
-            data_root = payload.get("data", {})
-            media_node = data_root.get("xdt_api__v1__media__shortcode__web_info", {}).get("items", [])
-            if not media_node and "shortcode_media" in data_root:
-                media_node = [data_root["shortcode_media"]]
-            if not media_node:
-                media_node = [payload]
+            # Recursive helper to find any inner media structures safely inside the json block
+            def extract_media_nodes(data):
+                nodes = []
+                if isinstance(data, dict):
+                    # Check if this dictionary itself describes a single media asset or carousel item
+                    if "video_url" in data or "display_url" in data or "image_versions2" in data:
+                        # Ensure it's a leaf node containing actual media data, not a parent wrapper
+                        if not any(k in data for k in ["shortcode_media", "xdt_api__v1__media__shortcode__web_info"]):
+                            nodes.append(data)
+                    
+                    # Traverse down nested arrays or child layouts 
+                    for k, v in data.items():
+                        if k in ["carousel_media", "edge_sidecar_to_children", "edges"]:
+                            if isinstance(v, list):
+                                for item in v:
+                                    nodes.extend(extract_media_nodes(item))
+                            elif isinstance(v, dict):
+                                nodes.extend(extract_media_nodes(v))
+                        else:
+                            nodes.extend(extract_media_nodes(v))
+                elif isinstance(data, list):
+                    for item in data:
+                        nodes.extend(extract_media_nodes(item))
+                return nodes
 
-            items_to_download = []
-            for item in media_node:
-                carousel = item.get("carousel_media") or item.get("edge_sidecar_to_children", {}).get("edges", [])
-                if carousel:
-                    for sub_item in carousel:
-                        node = sub_item.get("node", sub_item)
-                        items_to_download.append(node)
-                else:
-                    items_to_download.append(item)
+            # Extract every available media item block found in the JSON payload
+            items_to_download = extract_media_nodes(payload)
+            
+            # Fallback if recursive extraction was too strict: try top level items list
+            if not items_to_download:
+                data_root = payload.get("data", {})
+                web_info = data_root.get("xdt_api__v1__media__shortcode__web_info", {})
+                items_to_download = web_info.get("items", []) or payload.get("items", [])
 
             downloaded_paths = []
             for index, media in enumerate(items_to_download):
-                video_url = media.get("video_url") or (media.get("video_versions", [{}])[0].get("url") if media.get("video_versions") else None)
-                image_url = media.get("display_url") or (media.get("image_versions2", {}).get("candidates", [{}])[0].get("url") if media.get("image_versions2") else None)
+                if isinstance(media, dict) and "node" in media:
+                    media = media["node"]
+
+                # Resolve video urls
+                video_url = media.get("video_url")
+                if not video_url and "video_versions" in media and media["video_versions"]:
+                    video_url = media["video_versions"][0].get("url")
                 
+                # Resolve image urls
+                image_url = media.get("display_url")
+                if not image_url and "image_versions2" in media:
+                    candidates = media["image_versions2"].get("candidates", [])
+                    if candidates:
+                        image_url = candidates[0].get("url")
+
                 is_video = bool(video_url)
                 if choice == "video" and not is_video:
                     continue
@@ -205,6 +234,7 @@ def download_instagram_media_sync(url: str, url_key: str, choice: str = "all") -
                 
             if downloaded_paths:
                 return downloaded_paths
+                
         except Exception as e:
             raise RuntimeError(f"Private GraphQL data structural parsing failure: {e}")
 
