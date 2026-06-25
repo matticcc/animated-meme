@@ -33,7 +33,7 @@ _RENDER_COOKIES = Path("/etc/secrets/youtube_cookies.txt")
 _RUNTIME_COOKIES = DOWNLOAD_DIR / "youtube_cookies.txt"
 
 MAX_FILESIZE_MB = 500
-TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50MB strict limit
+TELEGRAM_MAX_BYTES = 150 * 1024 * 1024  # 50MB strict limit
 
 KNOWN_SITES: dict[str, str] = {
     "tiktok.com":  "TikTok",
