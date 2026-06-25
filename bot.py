@@ -311,7 +311,53 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "3. Paste and send that text block directly into this chat!",
         parse_mode="Markdown"
     )
-
+    
+async def handle_instagram_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    
+    _, url_key, choice = query.data.split("|", 2)
+    data = ctx.user_data.get(url_key)
+    if not data:
+        await query.edit_message_text("❌ Session expired. Send your link/data again.")
+        return
+        
+    is_raw = data.get("is_raw", False)
+    target_payload = data["raw_json"] if is_raw else data["url"]
+    
+    await query.edit_message_text("⬇️ Compiling assets... please wait.")
+    
+    try:
+        files = await asyncio.get_event_loop().run_in_executor(
+            None, parse_and_download_instagram, target_payload, url_key, choice, is_raw
+        )
+    except Exception as e:
+        await query.edit_message_text(f"❌ *Processing error:*\n`{str(e)}`", parse_mode="Markdown")
+        return
+        
+    if not files:
+        await query.edit_message_text("❌ No media matches found. If it's private, confirm your browser text block copy is complete.")
+        return
+        
+    images = [f for f in files if f.suffix.lower() in IMAGE_EXTS]
+    videos = [f for f in files if f.suffix.lower() not in IMAGE_EXTS]
+    
+    await query.edit_message_text("📤 Uploading media files to Telegram...")
+    
+    try:
+        if images:
+            await send_photos(query.message, images)
+        for vid in videos:
+            with open(vid, "rb") as f:
+                await query.message.reply_video(video=f, supports_streaming=True)
+        await query.delete_message()
+    except Exception as e:
+        await query.edit_message_text(f"❌ Upload breakdown error: `{e}`", parse_mode="Markdown")
+    finally:
+        for fp in files:
+            fp.unlink(missing_ok=True)
+        ctx.user_data.pop(url_key, None)
+        
 async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text.strip()
     
