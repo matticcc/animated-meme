@@ -629,53 +629,93 @@ def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "
         try:
             payload = json.loads(target_data)
 
-            def find_media_blocks(data):
-                blocks = []
-                if isinstance(data, dict):
-                    if any(k in data for k in ["video_versions", "image_versions2", "video_url", "display_url"]):
-                        if not any(k in data for k in ["shortcode_media", "xdt_api__v1__media__shortcode__web_info"]):
-                            blocks.append(data)
-                    if "carousel_media" in data and isinstance(data["carousel_media"], list):
-                        for item in data["carousel_media"]:
-                            blocks.extend(find_media_blocks(item))
-                    for v in data.values():
-                        blocks.extend(find_media_blocks(v))
-                elif isinstance(data, list):
-                    for item in data:
-                        blocks.extend(find_media_blocks(item))
-                return blocks
-
-            media_items = find_media_blocks(payload)
-            if not media_items:
-                root = payload.get("data", {})
-                web_info = root.get("xdt_api__v1__media__shortcode__web_info", {})
-                media_items = web_info.get("items", []) or payload.get("items", []) or root.get("shortcode_media", [])
-                if isinstance(media_items, dict):
-                    media_items = [media_items]
-
-            normalized_items = []
-            for item in media_items:
-                if isinstance(item, dict) and "node" in item:
-                    item = item["node"]
-                if isinstance(item, dict):
-                    normalized_items.append(item)
-
-            seen_urls = set()
+            # ── 1. Check for standard Story GraphQL structure first ──
+            reels = payload.get("data", {}).get("reels_media", []) or payload.get("data", {}).get("xdt_api__v1__feed__reels_media__connection", {}).get("reels_media", [])
+            story_items = []
+            if reels:
+                for reel in reels:
+                    story_items.extend(reel.get("items", []))
+            
             unique_items = []
-            for item in normalized_items:
-                v_url = item.get("video_url")
-                if not v_url and "video_versions" in item and item["video_versions"]:
-                    v_url = item["video_versions"][0].get("url")
-                i_url = None
-                if "image_versions2" in item and item["image_versions2"].get("candidates"):
-                    i_url = item["image_versions2"]["candidates"][0].get("url")
-                if not i_url:
-                    i_url = item.get("display_url")
-                primary = v_url if v_url else i_url
-                if primary and primary not in seen_urls:
-                    seen_urls.add(primary)
-                    unique_items.append((item, v_url, i_url))
+            seen_urls = set()
 
+            if story_items:
+                # Standard story structure parsing
+                for item in story_items:
+                    v_url, i_url = None, None
+                    
+                    if item.get("is_video"):
+                        v_res = item.get("video_resources") or item.get("video_versions") or []
+                        if v_res:
+                            # Sort by width descending to get best quality
+                            v_res_sorted = sorted(v_res, key=lambda x: x.get("config_width", 0), reverse=True)
+                            v_url = v_res_sorted[0].get("src") or v_res_sorted[0].get("url")
+                    
+                    i_res = item.get("display_resources") or []
+                    if i_res:
+                        i_res_sorted = sorted(i_res, key=lambda x: x.get("config_width", 0), reverse=True)
+                        i_url = i_res_sorted[0].get("src") or i_res_sorted[0].get("url")
+                    if not i_url:
+                        i_url = item.get("display_url")
+
+                    primary = v_url if v_url else i_url
+                    if primary and primary not in seen_urls:
+                        seen_urls.add(primary)
+                        unique_items.append((item, v_url, i_url))
+            else:
+                # ── 2. Fallback to the recursive checker for Feed Posts / Carousels ──
+                def find_media_blocks(data):
+                    blocks = []
+                    if isinstance(data, dict):
+                        if any(k in data for k in ["video_versions", "image_versions2", "video_url", "display_url", "video_resources"]):
+                            if not any(k in data for k in ["shortcode_media", "xdt_api__v1__media__shortcode__web_info"]):
+                                blocks.append(data)
+                        if "carousel_media" in data and isinstance(data["carousel_media"], list):
+                            for item in data["carousel_media"]:
+                                blocks.extend(find_media_blocks(item))
+                        for v in data.values():
+                            blocks.extend(find_media_blocks(v))
+                    elif isinstance(data, list):
+                        for item in data:
+                            blocks.extend(find_media_blocks(item))
+                    return blocks
+
+                media_items = find_media_blocks(payload)
+                if not media_items:
+                    root = payload.get("data", {})
+                    web_info = root.get("xdt_api__v1__media__shortcode__web_info", {})
+                    media_items = web_info.get("items", []) or payload.get("items", []) or root.get("shortcode_media", [])
+                    if isinstance(media_items, dict):
+                        media_items = [media_items]
+
+                normalized_items = []
+                for item in media_items:
+                    if isinstance(item, dict) and "node" in item:
+                        item = item["node"]
+                    if isinstance(item, dict):
+                        normalized_items.append(item)
+
+                for item in normalized_items:
+                    v_url = item.get("video_url")
+                    if not v_url and "video_versions" in item and item["video_versions"]:
+                        v_url = item["video_versions"][0].get("url")
+                    if not v_url and "video_resources" in item and item["video_resources"]:
+                        v_url = sorted(item["video_resources"], key=lambda x: x.get("config_width", 0), reverse=True)[0].get("src")
+                        
+                    i_url = None
+                    if "image_versions2" in item and item["image_versions2"].get("candidates"):
+                        i_url = item["image_versions2"]["candidates"][0].get("url")
+                    if not i_url and "display_resources" in item and item["display_resources"]:
+                        i_url = sorted(item["display_resources"], key=lambda x: x.get("config_width", 0), reverse=True)[0].get("src")
+                    if not i_url:
+                        i_url = item.get("display_url")
+
+                    primary = v_url if v_url else i_url
+                    if primary and primary not in seen_urls:
+                        seen_urls.add(primary)
+                        unique_items.append((item, v_url, i_url))
+
+            # ── 3. Download the resolved items ──
             for idx, (item, video_url, image_url) in enumerate(unique_items):
                 if dynamic_target_idx is not None and dynamic_target_idx != "all":
                     if int(dynamic_target_idx) != idx:
