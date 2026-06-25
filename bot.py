@@ -488,7 +488,7 @@ async def send_photos(message, files: list[Path]) -> None:
 # ── Handler Logic ─────────────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("👋 Send me a URL from YouTube, TikTok, Reddit, RedGifs, or Instagram.")
+    await update.message.reply_text("👋 Send me a URL and i'll download it")
 
 async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = ""
