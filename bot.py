@@ -180,39 +180,62 @@ def collect_image_files(url_key: str) -> list[Path]:
 
 def download_images(url: str, url_key: str) -> list[Path]:
     """
-    Download all images from an image post.
-    Tries yt-dlp first; falls back to gallery-dl if that fails or yields nothing.
-    Returns sorted list of downloaded image Paths.
+    Downloads images/photos from supported sites (like Instagram or TikTok).
     """
-    out_tpl = str(DOWNLOAD_DIR / f"{url_key}_%(autonumber)03d.%(ext)s")
-
-    # Try yt-dlp first (works for Instagram carousels and some TikTok slideshows)
-    if not is_tiktok_photo_url(url):
-        _, stderr, code = run_ytdlp(base_args(url) + ["-o", out_tpl, url])
-        files = collect_image_files(url_key)
-        if files:
-            return files
-
-    # Fall back to gallery-dl (handles TikTok /photo/ and anything yt-dlp missed)
-    sub = DOWNLOAD_DIR / url_key
-    sub.mkdir(exist_ok=True)
-    run_gallerydl(url, sub)
-
-    gdl_files = sorted([
-        p for p in sub.rglob("*")
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTS
-    ])
-    moved = []
-    for i, fp in enumerate(gdl_files):
-        dest = DOWNLOAD_DIR / f"{url_key}_{i:03d}{fp.suffix}"
-        fp.rename(dest)
-        moved.append(dest)
+    out = str(DOWNLOAD_DIR / f"{url_key}_%(index)s.%(ext)s")
+    
+    # Base arguments (includes --no-warnings and cookies if available)
+    dl_args = base_args(url) + [
+        "--skip-download",
+        "--dump-json",
+        "--no-playlist",
+        url,
+    ]
+    
     try:
-        sub.rmdir()
+        stdout, stderr, code = run_ytdlp(dl_args)
+        if code != 0:
+            raise RuntimeError(stderr)
+            
+        # Parse the JSON to look for image entries
+        urls = []
+        if "\n" in stdout.strip():
+            # Multiple lines (playlist/carousel items)
+            for line in stdout.strip().split("\n"):
+                if not line.strip():
+                    continue
+                data = json.loads(line)
+                # Check for automatic captions/thumbnails or requested formats
+                if "url" in data:
+                    urls.append(data["url"])
+        else:
+            data = json.loads(stdout)
+            if "url" in data:
+                urls.append(data["url"])
+                
     except Exception:
+        # Fallback directly to downloading via yt-dlp with unplayable formats allowed
         pass
 
-    return moved if moved else collect_image_files(url_key)
+    # Core fix: Include --allow-unplayable-formats so yt-dlp grabs images
+    dl_args = base_args(url) + [
+        "--allow-unplayable-formats",  # <-- THIS IS THE CRITICAL FIX FOR INSTAGRAM PHOTOS
+        "--no-playlist",
+        "-o", out,
+        url,
+    ]
+    
+    stdout, stderr, code = run_ytdlp(dl_args)
+    
+    # Gather downloaded image files matching the pattern
+    files = list(DOWNLOAD_DIR.glob(f"{url_key}_*"))
+    # Filter only actual images
+    files = [f for f in files if f.suffix.lower() in IMAGE_EXTS]
+    
+    if not files:
+        raise RuntimeError("No photos found or post private on any link.")
+        
+    return files
 
 
 # ── Keyboard builders ──────────────────────────────────────────────────────────
