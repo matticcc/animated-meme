@@ -608,6 +608,19 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     url     = data["url"]
     presets = data.get("presets", [])
 
+    if "redgifs.com" in url.lower():
+        # RedGifs optimization: force a clean web-streamable MP4 wrapper directly
+        fmt_arg = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        is_audio = False
+    elif choice == "audio":
+        fmt_arg, is_audio = "bestaudio/best", True
+    elif choice == "best":
+        fmt_arg, is_audio = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best", False
+    else:
+        idx = int(choice)
+        fmt_arg = presets[idx] if idx < len(presets) else "bestvideo+bestaudio/best"
+        is_audio = False
+
     if choice == "audio":
         fmt_arg, is_audio = "bestaudio/best", True
     elif choice == "best":
