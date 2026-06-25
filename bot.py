@@ -138,10 +138,18 @@ def extract_url(text: str) -> str | None:
 def base_args(url: str) -> list[str]:
     args = [
         "--no-warnings",
+        "--rm-cache-dir",
         "--no-cache-dir"
     ]
-    if "tiktok.com" in url.lower():
+    
+    # FIX FOR YOUTUBE FORMAT DECRYPTION WALL
+    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
+        # Tells yt-dlp to bypass desktop requirements and request mobile streaming blocks
+        args += ["--extractor-args", "youtube:client=ios"]
+        
+    elif "tiktok.com" in url.lower():
         args += ["--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"]
+        
     elif "redgifs.com" in url.lower():
         args += ["--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"]
         args += ["--socket-timeout", "15"]
