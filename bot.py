@@ -139,7 +139,7 @@ def base_args(url: str) -> list[str]:
         # Fallback chain: tv_embedded → android → web (web_creator as last resort).
         args += [
             "--extractor-args",
-            "youtube:player_client=tv_embedded,android,web_creator",
+            "youtube:player_client=android,web,tv_embedded",
         ]
         # Cookie handling: prefer writable copy so yt-dlp can update the jar
         yt_cookies_path = DOWNLOAD_DIR / "youtube_cookies.txt"
@@ -593,7 +593,8 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
         
     msg = await update.message.reply_text(f"🔍 Scraping **{site}** content...", parse_mode="Markdown")
-        
+    url_key = str(msg.message_id)
+
     if is_tiktok_photo_url(url):
         files = await asyncio.get_event_loop().run_in_executor(None, download_images, url, url_key)
         if not files:
