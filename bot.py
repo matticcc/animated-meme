@@ -196,40 +196,51 @@ def is_tiktok_photo_url(url: str) -> bool:
 def fetch_instagram_public(url: str, url_key: str) -> list[Path] | None:
     """
     Download a public Instagram post (photo/reel/carousel).
-    - Image posts: yt-dlp works without cookies but breaks with them
-    - Reels/videos: require cookies
-    So we try without cookies first, then with.
+    - Images/carousels: gallery-dl with cookies
+    - Reels/videos: yt-dlp with cookies
     """
     cookies = get_cookies_path()
-
-    base = [
-        "--no-warnings", "--rm-cache-dir", "--no-cache-dir",
-        "--user-agent",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-        "Mobile/15E148 Safari/604.1",
-        "--add-header", "X-Ig-App-Id:936619743392459",
-        "--socket-timeout", "20",
-        "--no-playlist",
-    ]
 
     def collected() -> list[Path]:
         return [p for p in DOWNLOAD_DIR.glob(f"{url_key}_*")
                 if not p.name.endswith((".part", ".ytdl"))]
 
-    # ── Attempt 1: no cookies (works for public image posts) ──────────────
-    out_img = str(DOWNLOAD_DIR / f"{url_key}_%(autonumber)03d.%(ext)s")
-    run_ytdlp(base + ["-o", out_img, url])
-    files = collected()
-    if files:
-        return files
-
-    # ── Attempt 2: with cookies, video format (reels / private posts) ─────
+    # ── Attempt 1: gallery-dl (handles image posts and carousels) ─────────
+    sub = DOWNLOAD_DIR / url_key
+    sub.mkdir(exist_ok=True)
+    gdl_args = ["gallery-dl", "--dest", str(sub)]
     if cookies:
+        gdl_args += ["-C", str(cookies)]
+    gdl_args.append(url)
+    subprocess.run(gdl_args, capture_output=True, text=True, timeout=120)
+    gdl_files = sorted([p for p in sub.rglob("*")
+                        if p.is_file() and p.suffix.lower() in IMAGE_EXTS])
+    if gdl_files:
+        moved = []
+        for i, fp in enumerate(gdl_files):
+            dest = DOWNLOAD_DIR / f"{url_key}_{i:03d}{fp.suffix}"
+            fp.rename(dest)
+            moved.append(dest)
+        try: sub.rmdir()
+        except Exception: pass
+        return moved
+
+    # ── Attempt 2: yt-dlp with cookies (reels / video posts) ─────────────
+    if cookies:
+        ig_args = [
+            "--no-warnings", "--rm-cache-dir", "--no-cache-dir",
+            "--user-agent",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+            "Mobile/15E148 Safari/604.1",
+            "--add-header", "X-Ig-App-Id:936619743392459",
+            "--cookies", str(cookies),
+            "--socket-timeout", "20",
+            "--no-playlist",
+        ]
         out_vid = str(DOWNLOAD_DIR / f"{url_key}_%(title).60s.%(ext)s")
         fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
-        run_ytdlp(base + [
-            "--cookies", str(cookies),
+        run_ytdlp(ig_args + [
             "-f", fmt, "--merge-output-format", "mp4",
             "--format-sort", "ext:mp4:m4a",
             "-o", out_vid, url,
