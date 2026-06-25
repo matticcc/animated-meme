@@ -51,13 +51,14 @@ IMAGE_CAPABLE_SITES = {"tiktok.com", "instagram.com"}
 IMAGE_EXTS          = {".jpg", ".jpeg", ".png", ".webp"}
 
 # Simplified global structure to entirely avoid unterminated string crashes
+# Clean configuration block to resolve the line 56 crash
 QUALITY_PRESETS = [
-    ("4K", "2160"),
-    ("2K", "1440"),
-    ("1080p", "1080"),
-    ("720p", "720"),
-    ("480p", "480"),
-    ("360p", "360")
+    ("4K", "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/best"),
+    ("2K", "bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/best"),
+    ("1080p", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best"),
+    ("720p", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best"),
+    ("480p", "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best"),
+    ("360p", "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best")
 ]
 
 # ── Cookie helpers ─────────────────────────────────────────────────────────────
