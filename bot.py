@@ -647,15 +647,15 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         h = presets[idx] if idx < len(presets) else "1080"
         fmt_arg = (
             f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={h}][ext=webm]+bestaudio[ext=webm]/"
             f"bestvideo[height<={h}]+bestaudio/"
             f"best[height<={h}]/"
             f"best"
         )
-        is_audio = False
 
     await query.edit_message_text("⬇️ Compiling media payload files...")
     out = str(DOWNLOAD_DIR / f"{url_key}_%(title).60s.%(ext)s")
-    dl_args = base_args(url) + ["-f", fmt_arg, "--merge-output-format", "mp4", "--no-playlist", "-o", out, url]
+    dl_args = base_args(url) + ["-f", fmt_arg, "--merge-output-format", "mp4", "--no-playlist", "--format-sort", "ext:mp4:m4a", "-o", out, url]
     if is_audio:
         dl_args += ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"]
 
