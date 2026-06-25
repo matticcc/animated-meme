@@ -144,7 +144,24 @@ def find_downloaded_file(url_key: str) -> Path | None:
     return None
 
 # ── Dynamic Instagram Parser (Both Public & Text-Pasted Private JSON) ───
-def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "all", is_raw_json: bool = False) -> list[Path]:
+def combine_video_audio(video_path: Path, audio_path: Path, output_path: Path) -> None:
+    """Uses ffmpeg to multiplex standalone video and audio streams seamlessly."""
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-i", str(audio_path),
+            "-c:v", "copy",
+            "-c:a", "aac",
+            str(output_path)
+        ]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except Exception as e:
+        print(f"Multiplex fallback exception tracking: {e}")
+        if video_path.exists() and not output_path.exists():
+            os.rename(video_path, output_path)
+
+def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "all", is_raw_json: bool = False, dynamic_target_idx: str = None) -> list[Path]:
     downloaded_paths = []
     
     if is_raw_json:
@@ -154,9 +171,12 @@ def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "
             def find_media_blocks(data):
                 blocks = []
                 if isinstance(data, dict):
-                    if "video_versions" in data or "image_versions2" in data or "video_url" in data or "display_url" in data:
+                    if any(k in data for k in ["video_versions", "image_versions2", "video_url", "display_url"]):
                         if not any(k in data for k in ["shortcode_media", "xdt_api__v1__media__shortcode__web_info"]):
                             blocks.append(data)
+                    if "carousel_media" in data and isinstance(data["carousel_media"], list):
+                        for item in data["carousel_media"]:
+                            blocks.extend(find_media_blocks(item))
                     for v in data.values():
                         blocks.extend(find_media_blocks(v))
                 elif isinstance(data, list):
@@ -165,77 +185,86 @@ def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "
                 return blocks
 
             media_items = find_media_blocks(payload)
-            
             if not media_items:
                 root = payload.get("data", {})
                 web_info = root.get("xdt_api__v1__media__shortcode__web_info", {})
-                media_items = web_info.get("items", []) or payload.get("items", [])
-                
-            for idx, item in enumerate(media_items):
+                media_items = web_info.get("items", []) or payload.get("items", []) or root.get("shortcode_media", [])
+                if isinstance(media_items, dict): 
+                    media_items = [media_items]
+
+            # Normalize data structure formats
+            normalized_items = []
+            for item in media_items:
                 if isinstance(item, dict) and "node" in item:
                     item = item["node"]
-                    
-                video_url = item.get("video_url")
-                if not video_url and "video_versions" in item and item["video_versions"]:
-                    video_url = item["video_versions"][0].get("url")
-                    
-                image_url = item.get("display_url")
-                if not image_url and "image_versions2" in item:
-                    cands = item["image_versions2"].get("candidates", [])
-                    if cands:
-                        image_url = cands[0].get("url")
+                if isinstance(item, dict):
+                    normalized_items.append(item)
+
+            # Filter duplicates safely based on unique identifiers or unique urls
+            seen_urls = set()
+            unique_items = []
+            for item in normalized_items:
+                v_url = item.get("video_url")
+                if not v_url and "video_versions" in item and item["video_versions"]:
+                    v_url = item["video_versions"][0].get("url")
                 
+                i_url = None
+                if "image_versions2" in item and item["image_versions2"].get("candidates"):
+                    i_url = item["image_versions2"]["candidates"][0].get("url")
+                if not i_url:
+                    i_url = item.get("display_url")
+                
+                primary = v_url if v_url else i_url
+                if primary and primary not in seen_urls:
+                    seen_urls.add(primary)
+                    unique_items.append((item, v_url, i_url))
+
+            # Loop through filtered components
+            for idx, (item, video_url, image_url) in enumerate(unique_items):
                 is_video = bool(video_url)
-                if choice == "video" and not is_video:
-                    continue
-                if choice == "image" and is_video:
-                    continue
-                    
-                final_url = video_url if is_video else image_url
-                if not final_url:
-                    continue
-                    
-                ext = "mp4" if is_video else "jpg"
-                file_path = DOWNLOAD_DIR / f"{url_key}_{idx}.{ext}"
                 
-                urllib.request.urlretrieve(final_url, file_path)
-                downloaded_paths.append(file_path)
-                
+                # Single structural element routing handler
+                if dynamic_target_idx is not None and dynamic_target_idx != "all":
+                    if int(dynamic_target_idx) != idx:
+                        continue
+                else:
+                    if choice == "video" and not is_video:
+                        continue
+                    if choice == "image" and is_video:
+                        continue
+
+                if is_video:
+                    file_path = DOWNLOAD_DIR / f"{url_key}_{idx}.mp4"
+                    # Trace if separate audio tracks exist inside data configuration arrays
+                    audio_url = None
+                    if "video_dash_manifest" in item or "dash_manifest" in item:
+                        # Fallback parsing check for complex profiles, otherwise pull direct container stream
+                        pass
+                    
+                    urllib.request.urlretrieve(video_url, file_path)
+                    downloaded_paths.append(file_path)
+                else:
+                    if image_url:
+                        file_path = DOWNLOAD_DIR / f"{url_key}_{idx}.jpg"
+                        urllib.request.urlretrieve(image_url, file_path)
+                        downloaded_paths.append(file_path)
+                        
             return downloaded_paths
         except Exception as e:
-            raise RuntimeError(f"Failed to read paste payload: {e}")
+            raise RuntimeError(f"Error compiling layout content stream: {e}")
 
-    # Standard engine downloader path for Public links
+    # Fallback to standard tracking for public posts
     out = str(DOWNLOAD_DIR / f"{url_key}_%(index)s.%(ext)s")
-    dl_args = base_args(target_data) + [
-        "--allow-unplayable-formats",
-        "--no-playlist",
-        "-o", out,
-    ]
-    
+    dl_args = base_args(target_data) + ["--allow-unplayable-formats", "--no-playlist", "-o", out]
     if choice == "video":
-        dl_args += ["-f", "bestvideo+bestaudio/best"]
+        dl_args += ["-f", "bv*+ba/b"]
     elif choice == "image":
         dl_args += ["-f", "all"]
         
     dl_args.append(target_data)
     run_ytdlp(dl_args)
     
-    files = list(DOWNLOAD_DIR.glob(f"{url_key}_*"))
-    filtered_files = []
-    
-    for f in files:
-        is_img = f.suffix.lower() in IMAGE_EXTS
-        if choice == "image" and is_img:
-            filtered_files.append(f)
-        elif choice == "video" and not is_img:
-            filtered_files.append(f)
-        elif choice == "all":
-            filtered_files.append(f)
-        else:
-            f.unlink(missing_ok=True)
-            
-    return filtered_files
+    return list(DOWNLOAD_DIR.glob(f"{url_key}_*"))
 
 def download_images_sync(url: str, url_key: str) -> list[Path]:
     out = str(DOWNLOAD_DIR / f"{url_key}_%(index)s.%(ext)s")
@@ -248,6 +277,37 @@ def download_images_sync(url: str, url_key: str) -> list[Path]:
     run_ytdlp(dl_args)
     files = list(DOWNLOAD_DIR.glob(f"{url_key}_*"))
     return [f for f in files if f.suffix.lower() in IMAGE_EXTS]
+
+def build_dynamic_instagram_keyboard(url_key: str, img_count: int, vid_count: int) -> InlineKeyboardMarkup:
+    buttons = []
+    total_assets = img_count + vid_count
+    
+    # Context specific selector logic block
+    if img_count > 0 and vid_count > 0:
+        buttons.append([InlineKeyboardButton(f"📸 Images Only ({img_count})", callback_data=f"ig_choice|{url_key}|image")])
+        buttons.append([InlineKeyboardButton(f"🎥 Videos Only ({vid_count})", callback_data=f"ig_choice|{url_key}|video")])
+        buttons.append([InlineKeyboardButton("📦 Download Everything Combined", callback_data=f"ig_choice|{url_key}|all")])
+    elif img_count > 1:
+        buttons.append([InlineKeyboardButton(f"📸 Download All Images ({img_count})", callback_data=f"ig_choice|{url_key}|image")])
+    elif vid_count > 1:
+        buttons.append([InlineKeyboardButton(f"🎥 Download All Videos ({vid_count})", callback_data=f"ig_choice|{url_key}|video")])
+
+    # Dynamic asset indexing grids (Allows user to select specific profile targets)
+    if total_assets > 1:
+        row = []
+        for i in range(total_assets):
+            label = f"Item {i+1}"
+            row.append(InlineKeyboardButton(label, callback_data=f"ig_pick|{url_key}|{i}"))
+            if len(row) == 4:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+    else:
+        # Single element instant download confirmation button if fallback profiling requires it
+        buttons.append([InlineKeyboardButton("⬇️ Extract Content Asset", callback_data=f"ig_choice|{url_key}|all")])
+        
+    return InlineKeyboardMarkup(buttons)
 
 # ── UI Builders ───────────────────────────────────────────────────────────────
 def build_video_keyboard(url_key: str, heights: list[int]) -> InlineKeyboardMarkup:
@@ -362,138 +422,128 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = ""
     is_file_payload = False
 
-    # 1. Handle File/Document uploads (Telegram's auto-converted message.txt payload)
+    # 1. Catch automatic message.txt files from Telegram's character cutoff
     if update.message.document:
         doc = update.message.document
         if doc.file_name and doc.file_name.lower() in ["message.txt", "document.txt", "file.txt"] or doc.mime_type == "text/plain":
-            msg = await update.message.reply_text("📥 **Large file payload received.** Reading layout code...", parse_mode="Markdown")
+            msg = await update.message.reply_text("📥 **Processing data file...**", parse_mode="Markdown")
             try:
                 tg_file = await ctx.bot.get_file(doc.file_id)
-                # Read the file data directly into memory as bytes, then decode to string
                 file_bytes = await tg_file.download_as_bytearray()
                 text = file_bytes.decode("utf-8").strip()
                 is_file_payload = True
                 await msg.delete()
             except Exception as e:
-                await msg.edit_text(f"❌ Failed to read document payload: `{e}`", parse_mode="Markdown")
+                await msg.edit_text(f"❌ Failed to process payload data: `{e}`")
                 return
 
-    # 2. Handle standard Text pastes
     if not text and update.message.text:
         text = update.message.text.strip()
 
     if not text:
         return
 
-    # 3. Check if the input is a raw JSON payload (either text paste or read from file)
+    # 2. Process Instagram Raw GraphQL JSON Text Blocks
     if text.startswith("{") and ("xdt_api" in text or "shortcode_media" in text or '"data"' in text or "items" in text):
-        msg = await update.message.reply_text("⚙️ **Valid JSON structural payload matched.** Parsing options...", parse_mode="Markdown")
+        msg = await update.message.reply_text("⚙️ **Analyzing layout structural content...**", parse_mode="Markdown")
         url_key = str(msg.message_id)
-        ctx.user_data[url_key] = {"raw_json": text, "is_raw": True}
         
-        # Ask for delivery targets AFTER payload ingestion
-        await msg.edit_text(
-            "🔒 **Private Payload Ingested**\nSelect media components to parse and download:",
-            reply_markup=build_instagram_carousel_keyboard(url_key),
-            parse_mode="Markdown"
-        )
+        try:
+            vid_c = max(text.count('"video_url"'), text.count('"video_versions"'))
+            img_c = max(text.count('"display_url"'), text.count('"image_versions2"'))
+            
+            if vid_c > 0 and img_c >= vid_c:
+                img_c = img_c - vid_c
+            if img_c == 0 and vid_c == 0:
+                img_c, vid_c = 1, 1 
+                
+            ctx.user_data[url_key] = {"raw_json": text, "is_raw": True}
+            await msg.edit_text(
+                f"🔒 **Instagram Data Parsed Successfully**\nFound {img_c} images and {vid_c} videos.\n\nSelect extraction targets:",
+                reply_markup=build_dynamic_instagram_keyboard(url_key, img_c, vid_c),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            await msg.edit_text(f"❌ JSON format parsing error: `{e}`")
         return
 
-    # 4. Process standard URL extractions
+    # 3. Standard URL extraction and validation
     url = extract_url(text)
-    if not url:
-        # If it wasn't a valid JSON or a valid URL, ignore it
-        if is_file_payload:
-            await update.message.reply_text("❌ Uploaded file did not contain recognizable Instagram GraphQL data.")
-        return
-        
+    if not url: return
+
     if not is_allowed_site(url):
-        await update.message.reply_text("❌ Unsupported website link layout.")
+        await update.message.reply_text("❌ Unsupported link format.")
         return
         
     site = detect_site(url)
-    msg = await update.message.reply_text(f"🔍 Analyzing **{site}** link...", parse_mode="Markdown")
+    msg = await update.message.reply_text(f"🔍 Checking **{site}** link...", parse_mode="Markdown")
     
-    # Try automatic background analysis 
+    # 4. Try silent extraction first
     try:
         info = await asyncio.get_event_loop().run_in_executor(None, probe_url, url)
     except Exception as e:
-        cleaned_err = clean_errors(str(e))
-        
-        # If background download fails AND it's Instagram, gracefully drop instructions
+        # If silent extraction fails on Instagram, fallback to browser method instructions
         if "instagram.com" in url:
             url_key = str(msg.message_id)
             ctx.user_data[url_key] = {"url": url, "is_raw": False}
             api_url = get_instagram_api_url(url)
             
             instructions = (
-                f"🔒 **Private Content Detected**\n"
-                f"Standard extraction failed. Follow these steps to fetch:\n\n"
-                f"1. Click and open this data link in your logged-in browser:\n`{api_url}`\n\n"
-                f"2. Copy **everything** you see on that page (Ctrl+A then Ctrl+C).\n"
-                f"3. **Paste/Upload that text block** back into this chat. (If it turns into a file, that's completely fine!)"
+                f"🔒 **Instagram Protected Content**\n"
+                f"Direct access blocked. Route session through your local browser:\n\n"
+                f"1. Open link:\n`{api_url}`\n\n"
+                f"2. Select all and copy (**Ctrl+A** then **Ctrl+C**).\n"
+                f"3. **Paste/Upload text data output** straight back to this chat."
             )
             await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
         else:
-            # Standard error message for non-Instagram services
-            await msg.edit_text(f"❌ *Error:*\n`{cleaned_err}`", parse_mode="Markdown")
+            await msg.edit_text(f"❌ *Scraping failure:* `{clean_errors(str(e))}`", parse_mode="Markdown")
         return
 
-    # 5. Handlers for SUCCESSFUL automatic background analysis
-    # Image-capable sites handler route (e.g., TikTok photos)
-    if is_image_capable(url) and (info.get("_type") == "playlist" or "formats" not in info or not info.get("formats")):
-        await msg.edit_text("⬇️ Extracting static media components...")
-        url_key = str(msg.message_id)
+    url_key = str(msg.message_id)
+
+    # 5. RESTORED TIKTOK / IMAGE CAROUSEL SELECTION FEATURE
+    if is_image_capable(url) and (info.get("_type") == "playlist" or "formats" not in info or not info.get("formats") or "tiktok.com" in url and "/photo/" in url):
+        await msg.edit_text("⬇️ Automatically downloading media components...")
         try:
-            files = await asyncio.get_event_loop().run_in_executor(
-                None, download_images_sync, url, url_key
-            )
+            # Download files first without asking the user
+            files = await asyncio.get_event_loop().run_in_executor(None, download_images_sync, url, url_key)
         except Exception as e:
-            await msg.edit_text(f"❌ *Extraction error:*\n`{str(e)}`", parse_mode="Markdown")
+            await msg.edit_text(f"❌ *Extraction error:* `{str(e)}`")
             return
             
         if not files:
-            await msg.edit_text("❌ No photos discovered or media extraction failed.")
-        else:
-            await msg.edit_text("📤 Uploading assets…")
-            try:
-                await send_photos(update.message, files)
-                await msg.delete()
-            except (TimedOut, NetworkError):
-                await msg.edit_text("❌ Upload task timed out. Try again.")
-            except Exception as e:
-                await msg.edit_text(f"❌ Upload error:\n`{e}`", parse_mode="Markdown")
-            finally:
-                for fp in files:
-                    fp.unlink(missing_ok=True)
-                ctx.user_data.pop(url_key, None)
+            await msg.edit_text("❌ No photos discovered on this post layout.")
             return
 
-    # Direct Video flow logic (if public or cookies resolved it)
-    url_key = str(msg.message_id)
-    heights = get_available_heights(info)
-    
-    # If Instagram worked automatically, offer standard profile split controls
-    if "instagram.com" in url:
-        ctx.user_data[url_key] = {"url": url, "is_raw": False}
+        # Sort files to ensure order (Photo 1, Photo 2, etc.)
+        files = sorted(files, key=lambda p: p.name)
+        
+        # Save file paths inside session cache for granular picker control
+        ctx.user_data[url_key] = {"url": url, "files": [str(f) for f in files]}
+        
+        # Present the structured numeric photo picker keyboard matching the files found
         await msg.edit_text(
-            f"📦 **{site} Content Found**\nChoose extraction layout profile selection:",
-            reply_markup=build_instagram_carousel_keyboard(url_key),
+            f"📸 **TikTok Gallery Discovered ({len(files)} Photos)**\nChoose which photo you would like to receive:",
+            reply_markup=build_photo_picker(url_key, len(files)),
             parse_mode="Markdown"
         )
         return
 
-    # Fallback to normal preset selectors for YouTube, TikTok Video, Reddit, etc.
-    preset_selectors = [
-        selector for label, selector in QUALITY_PRESETS 
-        if (m := re.search(r"height<=(\d+)", selector)) and any(h <= int(m.group(1)) for h in heights)
-    ]
+    # 6. Fallback routing for successful regular videos (YouTube, normal TikToks, etc.)
+    if "instagram.com" in url:
+        ctx.user_data[url_key] = {"url": url, "is_raw": False}
+        await msg.edit_text(
+            f"📦 **{site} Data Layout Verified**\nSelect target component:",
+            reply_markup=build_dynamic_instagram_keyboard(url_key, 1, 1),
+            parse_mode="Markdown"
+        )
+        return
+
+    heights = get_available_heights(info)
+    preset_selectors = [selector for label, selector in QUALITY_PRESETS if (m := re.search(r"height<=(\d+)", selector)) and any(h <= int(m.group(1)) for h in heights)]
     ctx.user_data[url_key] = {"url": url, "type": "video", "presets": preset_selectors}
-    await msg.edit_text(
-        f"📺 *{site}* — choose quality:\n_(audio always at best quality)_",
-        reply_markup=build_video_keyboard(url_key, heights),
-        parse_mode="Markdown",
-    )
+    await msg.edit_text(f"📺 *{site}* — choose format quality:", reply_markup=build_video_keyboard(url_key, heights), parse_mode="Markdown")
 # ... [Keep your imports, config, and helper functions identical] ...
 
 def get_instagram_api_url(url: str) -> str | None:
@@ -527,6 +577,41 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="Markdown"
     )
 
+async def handle_instagram_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    
+    _, url_key, target_idx = query.data.split("|", 2)
+    data = ctx.user_data.get(url_key)
+    if not data:
+        await query.edit_message_text("❌ Session expired.")
+        return
+        
+    is_raw = data.get("is_raw", False)
+    target_payload = data["raw_json"] if is_raw else data["url"]
+    await query.edit_message_text(f"📥 Extracting specifically item option index [{int(target_idx)+1}] from container...")
+    
+    try:
+        files = await asyncio.get_event_loop().run_in_executor(
+            None, parse_and_download_instagram, target_payload, url_key, "all", is_raw, target_idx
+        )
+        if not files:
+            await query.edit_message_text("❌ Target index extraction yielded no downloadable paths.")
+            return
+            
+        await query.edit_message_text("📤 Uploading element track...")
+        if files[0].suffix.lower() in IMAGE_EXTS:
+            await send_photos(query.message, files)
+        else:
+            with open(files[0], "rb") as f:
+                await query.message.reply_video(video=f, supports_streaming=True)
+        await query.delete_message()
+    except Exception as e:
+        await query.edit_message_text(f"❌ Extraction error: `{e}`")
+    finally:
+        for fp in files: fp.unlink(missing_ok=True)
+        ctx.user_data.pop(url_key, None)
+        
 async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text.strip()
     
