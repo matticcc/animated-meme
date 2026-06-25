@@ -195,44 +195,54 @@ def is_tiktok_photo_url(url: str) -> bool:
 
 def fetch_instagram_public(url: str, url_key: str) -> list[Path] | None:
     """
-    Fetch a public Instagram post via the i.instagram.com media info API.
-    Uses the iPhone user-agent path which returns full media JSON without auth
-    for public posts. Returns list of Paths on success, None on failure.
+    Download a public Instagram post (photo/reel/carousel) using yt-dlp
+    with the same cookies file used by stories. Returns list of Paths on
+    success, None on failure.
     """
-    import urllib.request as _req
+    cookies = get_cookies_path()
 
-    match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
-    if not match:
+    ig_args = [
+        "--no-warnings", "--rm-cache-dir", "--no-cache-dir",
+        "--user-agent",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+        "Mobile/15E148 Safari/604.1",
+        "--add-header", "X-Ig-App-Id:936619743392459",
+        "--socket-timeout", "20",
+        "--no-playlist",
+    ]
+    if cookies:
+        ig_args += ["--cookies", str(cookies)]
+
+    # Single probe call to decide image vs video
+    stdout, _, code = run_ytdlp(ig_args + ["-J", "--flat-playlist", url])
+    if code != 0:
         return None
-    shortcode = match.group(1)
-
-    # The i.instagram.com/api/v1/media/shortcode/web_info/ endpoint returns
-    # full media JSON for public posts without requiring a login session.
-    api_url = f"https://i.instagram.com/api/v1/media/shortcode/web_info/?shortcode={shortcode}&include_reel=false"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-                      "Mobile/15E148 Safari/604.1",
-        "X-Ig-App-Id": "936619743392459",
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.instagram.com/",
-    }
 
     try:
-        req = _req.Request(api_url, headers=headers)
-        with _req.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
+        info = json.loads(stdout)
     except Exception:
         return None
 
-    # Response shape: {"items": [{...media...}]}
-    # Wrap it so parse_and_download_instagram can handle it
-    try:
-        raw_json = json.dumps(data)
-        return parse_and_download_instagram(raw_json, url_key, "all", is_raw_json=True)
-    except Exception:
-        return None
+    if is_image_post(info):
+        out_tpl = str(DOWNLOAD_DIR / f"{url_key}_%(autonumber)03d.%(ext)s")
+        _, _, dl_code = run_ytdlp(ig_args + ["-o", out_tpl, url])
+        if dl_code != 0:
+            return None
+        files = collect_image_files(url_key)
+        return files if files else None
+    else:
+        out_tpl = str(DOWNLOAD_DIR / f"{url_key}_%(title).60s.%(ext)s")
+        fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        _, _, dl_code = run_ytdlp(ig_args + [
+            "-f", fmt, "--merge-output-format", "mp4",
+            "--format-sort", "ext:mp4:m4a",
+            "-o", out_tpl, url,
+        ])
+        if dl_code != 0:
+            return None
+        found = find_downloaded_file(url_key)
+        return [found] if found else None
 
 
 def is_instagram_story_url(url: str) -> bool:
@@ -622,31 +632,35 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if files:
                 images = [f for f in files if f.suffix.lower() in IMAGE_EXTS]
                 videos = [f for f in files if f.suffix.lower() not in IMAGE_EXTS]
+                total  = len(files)
+                # All cases: store under "files" so handle_photo_pick serves them directly
+                ctx.user_data[url_key] = {"files": [str(p) for p in files]}
                 if images and not videos:
-                    ctx.user_data[url_key] = {"files": [str(p) for p in images]}
                     await msg.edit_text(
-                        f"🖼 Found {len(images)} photo(s):",
-                        reply_markup=build_photo_picker(url_key, len(images))
+                        f"🖼 Found {total} photo(s):",
+                        reply_markup=build_photo_picker(url_key, total)
                     )
-                elif videos and not images:
-                    # single video — go straight to quality picker via normal probe path
-                    for f in files:
-                        f.unlink(missing_ok=True)
-                    # fall through to probe_url below by clearing files
-                    files = None
+                elif videos and not images and total == 1:
+                    if videos[0].stat().st_size <= TELEGRAM_MAX_BYTES:
+                        await msg.edit_text("📤 Uploading...")
+                        with open(videos[0], "rb") as fh:
+                            await msg.reply_video(video=fh, supports_streaming=True,
+                                                  read_timeout=600, write_timeout=600)
+                        await msg.delete()
+                        videos[0].unlink(missing_ok=True)
+                        ctx.user_data.pop(url_key, None)
+                    else:
+                        dl_url = generate_download_link(videos[0])
+                        await msg.edit_text(
+                            f"📦 Video too large for Telegram.\n🔗 [Download directly]({dl_url})",
+                            parse_mode="Markdown"
+                        )
                 else:
-                    # mixed carousel
-                    img_c = len(images)
-                    vid_c = len(videos)
-                    ctx.user_data[url_key] = {"raw_json": json.dumps({"_prefetched_files": [str(f) for f in files]}), "is_raw": False, "_files": [str(f) for f in files]}
-                    await msg.edit_text(
-                        f"📊 **Instagram post fetched**\nFound {img_c} photo(s) and {vid_c} video(s).",
-                        reply_markup=build_dynamic_instagram_keyboard(url_key, img_c, vid_c),
-                        parse_mode="Markdown"
-                    )
-                    return
-                if files:
-                    return
+                    # multiple videos or mixed carousel — let user pick
+                    label = (f"🎥 Found {total} video(s):" if not images
+                             else f"📦 Found {len(images)} photo(s) and {len(videos)} video(s):")
+                    await msg.edit_text(label, reply_markup=build_photo_picker(url_key, total))
+                return
 
         # ── Stories: try automatic yt-dlp download first ──────────────────────
         if is_instagram_story_url(url):
