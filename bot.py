@@ -79,18 +79,12 @@ def run_health_server():
 
 # ── Download helpers ───────────────────────────────────────────────────────────
 def is_allowed_site(url: str) -> bool:
-    if "graphql/query" in url or "doc_id=" in url:
-        return True
     return any(d in url.lower() for d in ALLOWED_DOMAINS)
 
 def is_image_capable(url: str) -> bool:
-    if "graphql/query" in url or "doc_id=" in url:
-        return True
     return any(d in url.lower() for d in IMAGE_CAPABLE_SITES)
 
 def detect_site(url: str) -> str:
-    if "graphql/query" in url or "doc_id=" in url:
-        return "Instagram Private API"
     for domain, name in KNOWN_SITES.items():
         if domain in url.lower():
             return name
@@ -127,8 +121,7 @@ def clean_errors(err: str) -> str:
     return "\n".join(cleaned) if cleaned else "Unknown extraction error."
 
 def probe_url(url: str) -> dict:
-    if "graphql/query" in url or "doc_id=" in url:
-        return {"_type": "playlist", "entries": [{"is_live": False}]}
+    # CRITICAL FIX: Added --allow-unplayable-formats to probe_url so TikTok photo and IG profiles pass safely
     args = base_args(url) + ["-j", "--no-playlist", "--allow-unplayable-formats", url]
     stdout, stderr, code = run_ytdlp(args)
     if code != 0:
@@ -150,107 +143,82 @@ def find_downloaded_file(url_key: str) -> Path | None:
             return f
     return None
 
-# ── Dynamic Instagram/GraphQL Downloader Function ──────────────────────────────
-def download_instagram_media_sync(url: str, url_key: str, choice: str = "all") -> list[Path]:
-    out = str(DOWNLOAD_DIR / f"{url_key}_%(index)s.%(ext)s")
+# ── Dynamic Instagram Parser (Both Public & Text-Pasted Private JSON) ───
+def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "all", is_raw_json: bool = False) -> list[Path]:
+    downloaded_paths = []
     
-    # ── FEATURE: Direct Private Raw Data GraphQL link Handling ──
-    if "graphql/query" in url or "doc_id=" in url:
+    if is_raw_json:
         try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "*/*"
-            }
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+            payload = json.loads(target_data)
             
-            # Recursive helper to find any inner media structures safely inside the json block
-            def extract_media_nodes(data):
-                nodes = []
+            def find_media_blocks(data):
+                blocks = []
                 if isinstance(data, dict):
-                    # Check if this dictionary itself describes a single media asset or carousel item
-                    if "video_url" in data or "display_url" in data or "image_versions2" in data:
-                        # Ensure it's a leaf node containing actual media data, not a parent wrapper
+                    if "video_versions" in data or "image_versions2" in data or "video_url" in data or "display_url" in data:
                         if not any(k in data for k in ["shortcode_media", "xdt_api__v1__media__shortcode__web_info"]):
-                            nodes.append(data)
-                    
-                    # Traverse down nested arrays or child layouts 
-                    for k, v in data.items():
-                        if k in ["carousel_media", "edge_sidecar_to_children", "edges"]:
-                            if isinstance(v, list):
-                                for item in v:
-                                    nodes.extend(extract_media_nodes(item))
-                            elif isinstance(v, dict):
-                                nodes.extend(extract_media_nodes(v))
-                        else:
-                            nodes.extend(extract_media_nodes(v))
+                            blocks.append(data)
+                    for v in data.values():
+                        blocks.extend(find_media_blocks(v))
                 elif isinstance(data, list):
                     for item in data:
-                        nodes.extend(extract_media_nodes(item))
-                return nodes
+                        blocks.extend(find_media_blocks(item))
+                return blocks
 
-            # Extract every available media item block found in the JSON payload
-            items_to_download = extract_media_nodes(payload)
+            media_items = find_media_blocks(payload)
             
-            # Fallback if recursive extraction was too strict: try top level items list
-            if not items_to_download:
-                data_root = payload.get("data", {})
-                web_info = data_root.get("xdt_api__v1__media__shortcode__web_info", {})
-                items_to_download = web_info.get("items", []) or payload.get("items", [])
-
-            downloaded_paths = []
-            for index, media in enumerate(items_to_download):
-                if isinstance(media, dict) and "node" in media:
-                    media = media["node"]
-
-                # Resolve video urls
-                video_url = media.get("video_url")
-                if not video_url and "video_versions" in media and media["video_versions"]:
-                    video_url = media["video_versions"][0].get("url")
+            if not media_items:
+                root = payload.get("data", {})
+                web_info = root.get("xdt_api__v1__media__shortcode__web_info", {})
+                media_items = web_info.get("items", []) or payload.get("items", [])
                 
-                # Resolve image urls
-                image_url = media.get("display_url")
-                if not image_url and "image_versions2" in media:
-                    candidates = media["image_versions2"].get("candidates", [])
-                    if candidates:
-                        image_url = candidates[0].get("url")
-
+            for idx, item in enumerate(media_items):
+                if isinstance(item, dict) and "node" in item:
+                    item = item["node"]
+                    
+                video_url = item.get("video_url")
+                if not video_url and "video_versions" in item and item["video_versions"]:
+                    video_url = item["video_versions"][0].get("url")
+                    
+                image_url = item.get("display_url")
+                if not image_url and "image_versions2" in item:
+                    cands = item["image_versions2"].get("candidates", [])
+                    if cands:
+                        image_url = cands[0].get("url")
+                
                 is_video = bool(video_url)
                 if choice == "video" and not is_video:
                     continue
                 if choice == "image" and is_video:
                     continue
                     
-                target_cdn = video_url if is_video else image_url
-                if not target_cdn:
+                final_url = video_url if is_video else image_url
+                if not final_url:
                     continue
                     
                 ext = "mp4" if is_video else "jpg"
-                file_path = DOWNLOAD_DIR / f"{url_key}_{index}.{ext}"
+                file_path = DOWNLOAD_DIR / f"{url_key}_{idx}.{ext}"
                 
-                urllib.request.urlretrieve(target_cdn, file_path)
+                urllib.request.urlretrieve(final_url, file_path)
                 downloaded_paths.append(file_path)
                 
-            if downloaded_paths:
-                return downloaded_paths
-                
+            return downloaded_paths
         except Exception as e:
-            raise RuntimeError(f"Private GraphQL data structural parsing failure: {e}")
+            raise RuntimeError(f"Failed to read paste payload: {e}")
 
-    # Standard fallback path for public posts / carousel parameters using yt-dlp
-    dl_args = base_args(url) + [
+    # Standard engine downloader path for Public links
+    out = str(DOWNLOAD_DIR / f"{url_key}_%(index)s.%(ext)s")
+    dl_args = base_args(target_data) + [
         "--allow-unplayable-formats",
         "--no-playlist",
         "-o", out,
     ]
     
     if choice == "video":
-        dl_args += ["-f", "bv*+ba/b"]
+        dl_args += ["-f", "bestvideo+bestaudio/best"]
     elif choice == "image":
-        dl_args += ["-f", "worst"]
+        dl_args += ["-f", "all"]
         
-    dl_args.append(url)
+    dl_args.append(target_data)
     run_ytdlp(dl_args)
     
     files = list(DOWNLOAD_DIR.glob(f"{url_key}_*"))
@@ -269,13 +237,17 @@ def download_instagram_media_sync(url: str, url_key: str, choice: str = "all") -
             
     return filtered_files
 
-def run_instagram_download(url: str, url_key: str, choice: str = "all") -> list[Path]:
-    # Wrapper function for the event loop task runner executor
-    return download_instagram_media_sync(url, url_key, choice)
-
 def download_images_sync(url: str, url_key: str) -> list[Path]:
-    # General image engine downloader
-    return download_instagram_media_sync(url, url_key, "all")
+    out = str(DOWNLOAD_DIR / f"{url_key}_%(index)s.%(ext)s")
+    dl_args = base_args(url) + [
+        "--allow-unplayable-formats", 
+        "--no-playlist",
+        "-o", out,
+        url,
+    ]
+    run_ytdlp(dl_args)
+    files = list(DOWNLOAD_DIR.glob(f"{url_key}_*"))
+    return [f for f in files if f.suffix.lower() in IMAGE_EXTS]
 
 # ── UI Builders ───────────────────────────────────────────────────────────────
 def build_video_keyboard(url_key: str, heights: list[int]) -> InlineKeyboardMarkup:
@@ -304,7 +276,6 @@ def build_photo_picker(url_key: str, count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(grid)
 
 def build_instagram_carousel_keyboard(url_key: str) -> InlineKeyboardMarkup:
-    # Custom interface providing image vs video splits matching requested framework architecture
     buttons = [
         [InlineKeyboardButton("📸 Download Images Only", callback_data=f"ig_choice|{url_key}|image")],
         [InlineKeyboardButton("🎥 Download Videos Only", callback_data=f"ig_choice|{url_key}|video")],
@@ -324,8 +295,6 @@ async def send_photos(message, files: list[Path]) -> None:
                 f = open(fp, "rb")
                 opened_files.append(f)
                 media_group.append(InputMediaPhoto(media=f))
-            
-            # Send chunks of 10 max
             for i in range(0, len(media_group), 10):
                 await message.reply_media_group(media=media_group[i : i + 10])
         finally:
@@ -335,45 +304,57 @@ async def send_photos(message, files: list[Path]) -> None:
 # ── Telegram Handlers ──────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "👋 **Welcome!** Send me a supported media link to download video or audio.\n\n"
-        "✨ **Instagram Carousels:** Send any public post link and choose your preferred media split format!\n"
-        "🔒 **Private Instagram Posts:** Send the raw `/graphql/query/` content link from your browser dev console to scrape private feeds directly.",
+        "👋 **Welcome!** Send me a public video or Instagram/TikTok link.\n\n"
+        "🔒 **Private Posts Feature:**\n"
+        "1. Open the private query URL on your logged-in browser.\n"
+        "2. **Copy the whole page text** (the raw JSON layout code).\n"
+        "3. Paste and send that text block directly into this chat!",
         parse_mode="Markdown"
     )
 
-async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text
-    url = extract_url(text)
+async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text.strip()
     
-    if not url:
-        return
-        
-    if not is_allowed_site(url):
-        await update.message.reply_text("❌ Unsupported website link configuration.")
-        return
-        
-    site = detect_site(url)
-    msg = await update.message.reply_text(f"🔍 Analyzing **{site}** content link...", parse_mode="Markdown")
-    
-    # Intercept Instagram posts to offer filtering logic configurations
-    if "instagram.com" in url or "graphql/query" in url or "doc_id=" in url:
+    if text.startswith("{") and ("xdt_api" in text or "shortcode_media" in text or '"data"' in text):
+        msg = await update.message.reply_text("⚙️ **Valid raw data layout matched.** parsing structure options...", parse_mode="Markdown")
         url_key = str(msg.message_id)
-        ctx.user_data[url_key] = {"url": url}
+        ctx.user_data[url_key] = {"raw_json": text, "is_raw": True}
         await msg.edit_text(
-            f"📦 **{site} Post Detected**\nChoose how you want to download this carousel configuration choice:",
+            "🔒 **Private JSON Content Extracted**\nSelect media components to fetch from your browser session payload:",
             reply_markup=build_instagram_carousel_keyboard(url_key),
             parse_mode="Markdown"
         )
         return
 
-    # Standard public route logic matching initial script architecture profiles
+    url = extract_url(text)
+    if not url:
+        return
+        
+    if not is_allowed_site(url):
+        await update.message.reply_text("❌ Unsupported website link layout.")
+        return
+        
+    site = detect_site(url)
+    msg = await update.message.reply_text(f"🔍 Analyzing **{site}** content link...", parse_mode="Markdown")
+    
+    if "instagram.com" in url:
+        url_key = str(msg.message_id)
+        ctx.user_data[url_key] = {"url": url, "is_raw": False}
+        await msg.edit_text(
+            f"📦 **{site} Media Formats Discovered**\nChoose how you want to handle this layout profile split:",
+            reply_markup=build_instagram_carousel_keyboard(url_key),
+            parse_mode="Markdown"
+        )
+        return
+
     try:
         info = await asyncio.get_event_loop().run_in_executor(None, probe_url, url)
     except Exception as e:
         await msg.edit_text(f"❌ *Error:*\n`{clean_errors(str(e))}`", parse_mode="Markdown")
         return
-        
-    if is_image_capable(url) and info.get("_type") == "playlist":
+
+    # Image-capable sites like TikTok /photo/ structures handler route
+    if is_image_capable(url) and (info.get("_type") == "playlist" or "formats" not in info or not info.get("formats")):
         await msg.edit_text("⬇️ Extracting static media components...")
         url_key = str(msg.message_id)
         try:
@@ -385,8 +366,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
             
         if not files:
-            # Re-verify layout fallback configuration states
-            pass
+            await msg.edit_text("❌ No photos discovered or media extraction failed.")
         else:
             await msg.edit_text("📤 Uploading assets…")
             try:
@@ -422,29 +402,30 @@ async def handle_instagram_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     _, url_key, choice = query.data.split("|", 2)
     data = ctx.user_data.get(url_key)
     if not data:
-        await query.edit_message_text("❌ Session expired. Send the URL again.")
+        await query.edit_message_text("❌ Session expired. Send your link/data again.")
         return
         
-    url = data["url"]
-    await query.edit_message_text("⬇️ Extracting Instagram media profile choices...")
+    is_raw = data.get("is_raw", False)
+    target_payload = data["raw_json"] if is_raw else data["url"]
+    
+    await query.edit_message_text("⬇️ Compiling assets... please wait.")
     
     try:
         files = await asyncio.get_event_loop().run_in_executor(
-            None, run_instagram_download, url, url_key, choice
+            None, parse_and_download_instagram, target_payload, url_key, choice, is_raw
         )
     except Exception as e:
-        await query.edit_message_text(f"❌ *Download error:*\n`{str(e)}`", parse_mode="Markdown")
+        await query.edit_message_text(f"❌ *Processing error:*\n`{str(e)}`", parse_mode="Markdown")
         return
         
     if not files:
-        await query.edit_message_text("❌ No media files found matching your criteria profile setup.")
+        await query.edit_message_text("❌ No media matches found. If it's private, confirm your browser text block copy is complete.")
         return
         
-    # Classify file group allocations (Single mixed or image layout profiles)
     images = [f for f in files if f.suffix.lower() in IMAGE_EXTS]
     videos = [f for f in files if f.suffix.lower() not in IMAGE_EXTS]
     
-    await query.edit_message_text("📤 Dispatching media assets onto Telegram pipeline server...")
+    await query.edit_message_text("📤 Uploading media files to Telegram...")
     
     try:
         if images:
@@ -454,7 +435,7 @@ async def handle_instagram_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE
                 await query.message.reply_video(video=f, supports_streaming=True)
         await query.delete_message()
     except Exception as e:
-        await query.edit_message_text(f"❌ Processing upload mismatch logic: `{e}`", parse_mode="Markdown")
+        await query.edit_message_text(f"❌ Upload breakdown error: `{e}`", parse_mode="Markdown")
     finally:
         for fp in files:
             fp.unlink(missing_ok=True)
@@ -467,29 +448,21 @@ async def handle_photo_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     _, url_key, choice = query.data.split("|", 2)
     data = ctx.user_data.get(url_key)
     if not data:
-        await query.edit_message_text("❌ Session expired. Send the URL again.")
+        await query.edit_message_text("❌ Session expired.")
         return
         
-    all_files = [Path(p) for p in data.get("files", [])]
-    all_files = [p for p in all_files if p.exists()]
+    all_files = [Path(p) for p in data.get("files", []) if Path(p).exists()]
     if not all_files:
-        await query.edit_message_text("❌ Files no longer available. Send the URL again.")
+        await query.edit_message_text("❌ Files no longer available.")
         return
         
-    if choice == "all":
-        selected = all_files
-    else:
-        idx = int(choice)
-        selected = [all_files[idx]] if idx < len(all_files) else all_files
-        
-    await query.edit_message_text(f"📤 Uploading {len(selected)} photo(s)…")
+    selected = all_files if choice == "all" else [all_files[int(choice)]] if int(choice) < len(all_files) else all_files
+    await query.edit_message_text(f"📤 Uploading {len(selected)} image(s)...")
     try:
         await send_photos(query.message, selected)
         await query.delete_message()
-    except (TimedOut, NetworkError):
-        await query.edit_message_text("❌ Upload timed out. Please try again.")
     except Exception as e:
-        await query.edit_message_text(f"❌ Upload error:\n`{e}`", parse_mode="Markdown")
+        await query.edit_message_text(f"❌ Upload error: `{e}`")
     finally:
         for fp in all_files:
             fp.unlink(missing_ok=True)
@@ -502,7 +475,7 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     _, url_key, choice = query.data.split("|", 2)
     data = ctx.user_data.get(url_key)
     if not data:
-        await query.edit_message_text("❌ Session expired. Send the URL again.")
+        await query.edit_message_text("❌ Session expired.")
         return
         
     url = data["url"]
@@ -517,7 +490,7 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         fmt_arg = presets[idx] if idx < len(presets) else "bestvideo+bestaudio/best"
         is_audio = False
         
-    await query.edit_message_text("⬇️ Downloading… please wait.")
+    await query.edit_message_text("⬇️ Downloading video stream…")
     
     out = str(DOWNLOAD_DIR / f"{url_key}_%(title).60s.%(ext)s")
     dl_args = base_args(url) + [
@@ -542,38 +515,30 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         
     filepath = await asyncio.get_event_loop().run_in_executor(None, find_downloaded_file, url_key)
     if not filepath:
-        await query.edit_message_text("❌ File not found after download.")
+        await query.edit_message_text("❌ File not found after streaming compilation.")
         return
         
     size_bytes = filepath.stat().st_size
     if size_bytes > TELEGRAM_MAX_BYTES:
         filepath.unlink(missing_ok=True)
-        await query.edit_message_text(
-            f"❌ File too large ({size_bytes // 1024 // 1024} MB > {MAX_FILESIZE_MB} MB). Try a lower quality."
-        )
+        await query.edit_message_text(f"❌ File too large ({size_bytes // 1024 // 1024} MB). Pick a lower layout quality.")
         return
         
-    await query.edit_message_text("📤 Uploading to Telegram…")
+    await query.edit_message_text("📤 Dispatching media track payload...")
     try:
         with open(filepath, "rb") as f:
             if is_audio:
-                await query.message.reply_audio(audio=f, filename=filepath.name, read_timeout=300, write_timeout=300, connect_timeout=60)
+                await query.message.reply_audio(audio=f, filename=filepath.name, read_timeout=300, write_timeout=300)
             else:
-                await query.message.reply_video(video=f, filename=filepath.name, supports_streaming=True, read_timeout=300, write_timeout=300, connect_timeout=60)
+                await query.message.reply_video(video=f, filename=filepath.name, supports_streaming=True, read_timeout=300, write_timeout=300)
         await query.delete_message()
-    except (TimedOut, NetworkError):
-        await query.edit_message_text(
-            f"❌ Upload timed out ({size_bytes // 1024 // 1024} MB). Try a lower quality or retry."
-        )
     except Exception as e:
-        await query.edit_message_text(f"❌ Upload error:\n`{e}`", parse_mode="Markdown")
+        await query.edit_message_text(f"❌ Upload handling error: `{e}`")
     finally:
         filepath.unlink(missing_ok=True)
         ctx.user_data.pop(url_key, None)
 
-# ── Session cleanup ────────────────────────────────────────────────────────────
 def drop_existing_session() -> None:
-    import urllib.request
     base = f"https://api.telegram.org/bot{BOT_TOKEN}"
     for label, url in (
         ("deleteWebhook", f"{base}/deleteWebhook?drop_pending_updates=true"),
@@ -582,8 +547,8 @@ def drop_existing_session() -> None:
         try:
             urllib.request.urlopen(url, timeout=10)
             print(f"✅ Pre-start {label} OK")
-        except Exception as e:
-            print(f"⚠️ Pre-start {label}: {e}")
+        except Exception:
+            pass
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
@@ -594,33 +559,22 @@ def main() -> None:
     print(f"✅ Health server on :{PORT}")
     
     cp = get_cookies_path()
-    print(f"✅ Cookies: {cp}" if cp else "⚠️ No cookies file — some sites may require login")
+    print(f"✅ Cookies file loaded: {cp}" if cp else "⚠️ No cookies file supplied")
     
-    print("🔄 Dropping any existing session…")
     drop_existing_session()
-    time.sleep(2)
+    time.sleep(1)
     
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .write_timeout(30)
-        .pool_timeout(30)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     app.add_handler(CallbackQueryHandler(handle_download, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(handle_photo_pick, pattern=r"^pick\|"))
     app.add_handler(CallbackQueryHandler(handle_instagram_choice, pattern=r"^ig_choice\|"))
     
-    print("🤖 Bot polling…")
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=["message", "callback_query"],
-    )
+    print("🤖 Bot online and ready...")
+    app.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
     main()
