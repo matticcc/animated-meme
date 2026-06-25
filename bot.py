@@ -395,51 +395,130 @@ async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         parse_mode="Markdown",
     )
 
-async def handle_instagram_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
+# ... [Keep your imports, config, and helper functions identical] ...
+
+def get_instagram_api_url(url: str) -> str | None:
+    """Extracts the shortcode from an Instagram URL and returns the clean API endpoint."""
+    # Matches /p/abcde/, /reel/abcde/, /tv/abcde/, or share links
+    match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
+    if not match:
+        return None
+    shortcode = match.group(1)
+    # This endpoint returns the clean JSON data layout for the post
+    return f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
+
+# ── Telegram Handlers ──────────────────────────────────────────────────────────
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "👋 **Welcome!** Send me any public video link (YouTube, TikTok, Reddit).\n\n"
+        "🔒 **For Private Instagram Posts:**\n"
+        "Just send me the private Instagram link first! I will generate a secure data link for you to open in your browser.",
+        parse_mode="Markdown"
+    )
+
+async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text.strip()
     
-    _, url_key, choice = query.data.split("|", 2)
-    data = ctx.user_data.get(url_key)
-    if not data:
-        await query.edit_message_text("❌ Session expired. Send your link/data again.")
-        return
-        
-    is_raw = data.get("is_raw", False)
-    target_payload = data["raw_json"] if is_raw else data["url"]
-    
-    await query.edit_message_text("⬇️ Compiling assets... please wait.")
-    
-    try:
-        files = await asyncio.get_event_loop().run_in_executor(
-            None, parse_and_download_instagram, target_payload, url_key, choice, is_raw
+    # 1. Check if user is pasting raw JSON data back to us
+    if text.startswith("{") and ("xdt_api" in text or "shortcode_media" in text or '"data"' in text or "items" in text):
+        msg = await update.message.reply_text("⚙️ **Valid JSON payload matched.** Parsing structure options...", parse_mode="Markdown")
+        url_key = str(msg.message_id)
+        ctx.user_data[url_key] = {"raw_json": text, "is_raw": True}
+        await msg.edit_text(
+            "🔒 **Private Payload Processed**\nSelect what media components you want to extract from this data:",
+            reply_markup=build_instagram_carousel_keyboard(url_key),
+            parse_mode="Markdown"
         )
-    except Exception as e:
-        await query.edit_message_text(f"❌ *Processing error:*\n`{str(e)}`", parse_mode="Markdown")
+        return
+
+    # 2. Otherwise, treat it as a standard URL extraction
+    url = extract_url(text)
+    if not url:
         return
         
-    if not files:
-        await query.edit_message_text("❌ No media matches found. If it's private, confirm your browser text block copy is complete.")
+    if not is_allowed_site(url):
+        await update.message.reply_text("❌ Unsupported website link layout.")
         return
         
-    images = [f for f in files if f.suffix.lower() in IMAGE_EXTS]
-    videos = [f for f in files if f.suffix.lower() not in IMAGE_EXTS]
+    site = detect_site(url)
     
-    await query.edit_message_text("📤 Uploading media files to Telegram...")
-    
+    # Custom intercept block for Instagram (handling both Public and Private easily)
+    if "instagram.com" in url:
+        msg = await update.message.reply_text("🔍 Processing Instagram link...", parse_mode="Markdown")
+        url_key = str(msg.message_id)
+        ctx.user_data[url_key] = {"url": url, "is_raw": False}
+        
+        api_url = get_instagram_api_url(url)
+        
+        instructions = (
+            f"📦 **Instagram Link Identified**\n\n"
+            f"🔹 **If it's a PUBLIC post:**\n"
+            f"Just choose an extraction type below to download directly.\n\n"
+            f"🔒 **If it's a PRIVATE post:**\n"
+            f"1. Click and open this link in your logged-in browser:\n`{api_url}`\n"
+            f"2. Copy **everything** you see on that page (Ctrl+A then Ctrl+C).\n"
+            f"3. **Paste that raw text block** right here into this chat."
+        )
+        
+        await msg.edit_text(
+            instructions,
+            reply_markup=build_instagram_carousel_keyboard(url_key),
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+        return
+
+    # 3. Standard parsing fallback for TikTok, YouTube, etc.
+    msg = await update.message.reply_text(f"🔍 Analyzing **{site}** content link...", parse_mode="Markdown")
     try:
-        if images:
-            await send_photos(query.message, images)
-        for vid in videos:
-            with open(vid, "rb") as f:
-                await query.message.reply_video(video=f, supports_streaming=True)
-        await query.delete_message()
+        info = await asyncio.get_event_loop().run_in_executor(None, probe_url, url)
     except Exception as e:
-        await query.edit_message_text(f"❌ Upload breakdown error: `{e}`", parse_mode="Markdown")
-    finally:
-        for fp in files:
-            fp.unlink(missing_ok=True)
-        ctx.user_data.pop(url_key, None)
+        await msg.edit_text(f"❌ *Error:*\n`{clean_errors(str(e))}`", parse_mode="Markdown")
+        return
+
+    # Image-capable sites handler route (e.g., TikTok photos)
+    if is_image_capable(url) and (info.get("_type") == "playlist" or "formats" not in info or not info.get("formats")):
+        await msg.edit_text("⬇️ Extracting static media components...")
+        url_key = str(msg.message_id)
+        try:
+            files = await asyncio.get_event_loop().run_in_executor(
+                None, download_images_sync, url, url_key
+            )
+        except Exception as e:
+            await msg.edit_text(f"❌ *Extraction error:*\n`{str(e)}`", parse_mode="Markdown")
+            return
+            
+        if not files:
+            await msg.edit_text("❌ No photos discovered or media extraction failed.")
+        else:
+            await msg.edit_text("📤 Uploading assets…")
+            try:
+                await send_photos(update.message, files)
+                await msg.delete()
+            except (TimedOut, NetworkError):
+                await msg.edit_text("❌ Upload task timed out. Try again.")
+            except Exception as e:
+                await msg.edit_text(f"❌ Upload error:\n`{e}`", parse_mode="Markdown")
+            finally:
+                for fp in files:
+                    fp.unlink(missing_ok=True)
+                ctx.user_data.pop(url_key, None)
+            return
+
+    url_key = str(msg.message_id)
+    heights = get_available_heights(info)
+    preset_selectors = [
+        selector for label, selector in QUALITY_PRESETS 
+        if (m := re.search(r"height<=(\d+)", selector)) and any(h <= int(m.group(1)) for h in heights)
+    ]
+    ctx.user_data[url_key] = {"url": url, "type": "video", "presets": preset_selectors}
+    await msg.edit_text(
+        f"📺 *{site}* — choose quality:\n_(audio always at best quality)_",
+        reply_markup=build_video_keyboard(url_key, heights),
+        parse_mode="Markdown",
+    )
+
+# ... [Keep everything else below this exactly the same] ...
 
 async def handle_photo_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
