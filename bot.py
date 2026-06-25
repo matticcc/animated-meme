@@ -541,21 +541,34 @@ def get_instagram_graphql_instructions(url: str) -> tuple["str | None", bool]:
     """
     Build a GraphQL URL for manual browser paste (fallback when auto-fetch fails).
 
-    doc_id resolution: scrape live first, then env var fallback.
-    For stories also resolves user_id to build the reels_media query.
+    For STORIES:
+      - Tries to resolve user_id, but falls back to username string if it fails.
+      - doc_id: scrape story page first, then INSTAGRAM_STORY_DOC_ID env var.
+      - Last resort: returns the plain stories page URL so the user always gets
+        something clickable.
+
+    For POSTS:
+      - doc_id: scrape post page first, then INSTAGRAM_POST_DOC_ID env var.
     """
     if is_instagram_story_url(url):
         username, _ = extract_instagram_story_target(url)
         if not username:
             return None, True
+
+        # Try numeric user_id but DO NOT bail — fall back to username string
         cookies = get_cookies_path()
-        user_id = _resolve_instagram_user_id(username, cookies)
-        if not user_id:
-            return None, True
+        user_id = _resolve_instagram_user_id(username, cookies) or username
+
         story_doc_id = _scrape_story_doc_id(username) or INSTAGRAM_STORY_DOC_ID
         if not story_doc_id:
-            return None, True
-        variables = {"reel_ids": [user_id], "precomposed_overlay": False, "story_viewer_fetch_count": 50}
+            # Absolute last resort: plain stories URL the user can open
+            return f"https://www.instagram.com/stories/{urllib.parse.quote(username)}/", True
+
+        variables = {
+            "reel_ids": [user_id],
+            "precomposed_overlay": False,
+            "story_viewer_fetch_count": 50,
+        }
         encoded = urllib.parse.quote(json.dumps(variables, separators=(",", ":")))
         return f"https://www.instagram.com/graphql/query/?doc_id={story_doc_id}&variables={encoded}", True
 
