@@ -195,12 +195,14 @@ def is_tiktok_photo_url(url: str) -> bool:
 
 def fetch_instagram_public(url: str, url_key: str) -> list[Path] | None:
     """
-    Download a public Instagram post (photo/reel/carousel) using yt-dlp
-    with the same cookies file as stories.
+    Download a public Instagram post (photo/reel/carousel).
+    - Image posts: yt-dlp works without cookies but breaks with them
+    - Reels/videos: require cookies
+    So we try without cookies first, then with.
     """
     cookies = get_cookies_path()
 
-    ig_args = [
+    base = [
         "--no-warnings", "--rm-cache-dir", "--no-cache-dir",
         "--user-agent",
         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -210,30 +212,33 @@ def fetch_instagram_public(url: str, url_key: str) -> list[Path] | None:
         "--socket-timeout", "20",
         "--no-playlist",
     ]
-    if cookies:
-        ig_args += ["--cookies", str(cookies)]
 
     def collected() -> list[Path]:
         return [p for p in DOWNLOAD_DIR.glob(f"{url_key}_*")
                 if not p.name.endswith((".part", ".ytdl"))]
 
-    # Try video first (reels/video posts)
-    out_vid = str(DOWNLOAD_DIR / f"{url_key}_%(title).60s.%(ext)s")
-    fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
-    run_ytdlp(ig_args + [
-        "-f", fmt, "--merge-output-format", "mp4",
-        "--format-sort", "ext:mp4:m4a",
-        "-o", out_vid, url,
-    ])
+    # ── Attempt 1: no cookies (works for public image posts) ──────────────
+    out_img = str(DOWNLOAD_DIR / f"{url_key}_%(autonumber)03d.%(ext)s")
+    run_ytdlp(base + ["-o", out_img, url])
     files = collected()
     if files:
         return files
 
-    # No video — try image/carousel (ignores exit code, just check what landed)
-    out_img = str(DOWNLOAD_DIR / f"{url_key}_%(autonumber)03d.%(ext)s")
-    run_ytdlp(ig_args + ["-o", out_img, url])
-    files = collected()
-    return files if files else None
+    # ── Attempt 2: with cookies, video format (reels / private posts) ─────
+    if cookies:
+        out_vid = str(DOWNLOAD_DIR / f"{url_key}_%(title).60s.%(ext)s")
+        fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        run_ytdlp(base + [
+            "--cookies", str(cookies),
+            "-f", fmt, "--merge-output-format", "mp4",
+            "--format-sort", "ext:mp4:m4a",
+            "-o", out_vid, url,
+        ])
+        files = collected()
+        if files:
+            return files
+
+    return None
 
 
 def is_instagram_story_url(url: str) -> bool:
