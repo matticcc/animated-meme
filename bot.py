@@ -28,9 +28,8 @@ PORT         = int(os.environ.get("PORT", "10000"))
 DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "ytdlp_bot"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-_RENDER_COOKIES     = Path("/etc/secrets/youtube_cookies.txt")
-_INSTAGRAM_COOKIES  = Path("/etc/secrets/instagram_cookies.txt")
-_RUNTIME_COOKIES    = DOWNLOAD_DIR / "youtube_cookies.txt"
+_RENDER_COOKIES  = Path("/etc/secrets/youtube_cookies.txt")
+_RUNTIME_COOKIES = DOWNLOAD_DIR / "youtube_cookies.txt"
 
 MAX_FILESIZE_MB    = 500
 TELEGRAM_MAX_BYTES = MAX_FILESIZE_MB * 1024 * 1024
@@ -99,13 +98,9 @@ def extract_url(text: str) -> str | None:
 
 def base_args(url: str) -> list[str]:
     args = ["--no-warnings"]
-    # Separate cookie streams for stability
-    if "instagram.com" in url.lower() and _INSTAGRAM_COOKIES.exists():
-        args += ["--cookies", str(_INSTAGRAM_COOKIES)]
-    else:
-        cookies = get_cookies_path()
-        if cookies:
-            args += ["--cookies", str(cookies)]
+    cookies = get_cookies_path()
+    if cookies:
+        args += ["--cookies", str(cookies)]
     return args
 
 def run_ytdlp(args: list[str]) -> tuple[str, str, int]:
@@ -142,21 +137,6 @@ def get_instagram_api_url(url: str) -> str | None:
     }
     encoded_vars = urllib.parse.quote(json.dumps(variables))
     return f"https://www.instagram.com/graphql/query/?doc_id=8845758582119845&variables={encoded_vars}"
-
-def combine_video_audio(video_path: Path, audio_path: Path, output_path: Path) -> None:
-    try:
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(video_path),
-            "-i", str(audio_path),
-            "-c:v", "copy",
-            "-c:a", "aac",
-            str(output_path)
-        ]
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-    except Exception:
-        if video_path.exists() and not output_path.exists():
-            os.rename(video_path, output_path)
 
 def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "all", is_raw_json: bool = False, dynamic_target_idx: str = None) -> list[Path]:
     downloaded_paths = []
@@ -447,7 +427,7 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 
             ctx.user_data[url_key] = {"raw_json": text, "is_raw": True}
             await msg.edit_text(
-                f"🔒 **Instagram Data Parsed Successfully**\nFound {img_c} images and {vid_c} videos.\n\nSelect extraction targets:",
+                f"📊 **Instagram Data Parsed Successfully**\nFound {img_c} images and {vid_c} videos.\n\nSelect extraction targets:",
                 reply_markup=build_dynamic_instagram_keyboard(url_key, img_c, vid_c),
                 parse_mode="Markdown"
             )
@@ -463,6 +443,23 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
         
     site = detect_site(url)
+    
+    # Bypass server scraping completely for Instagram to avoid proxy blocks
+    if site == "Instagram":
+        msg = await update.message.reply_text(f"🔍 Routing **{site}** session...", parse_mode="Markdown")
+        url_key = str(msg.message_id)
+        ctx.user_data[url_key] = {"url": url, "is_raw": False}
+        api_url = get_instagram_api_url(url)
+        instructions = (
+            f"🛡️ **Instagram Link Detected**\n"
+            f"To bypass proxy and data center bans, grab the direct CDN mapping layouts from your browser:\n\n"
+            f"1. Open this link:\n`{api_url}`\n\n"
+            f"2. Select all text and copy (**Ctrl+A** then **Ctrl+C**).\n"
+            f"3. **Paste or upload the text file layout** right here in this chat stream."
+        )
+        await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
+        return
+
     msg = await update.message.reply_text(f"🔍 Checking **{site}** link...", parse_mode="Markdown")
     url_key = str(msg.message_id)
 
@@ -491,19 +488,7 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         info = await asyncio.get_event_loop().run_in_executor(None, probe_url, url)
     except Exception as e:
-        if "instagram.com" in url:
-            ctx.user_data[url_key] = {"url": url, "is_raw": False}
-            api_url = get_instagram_api_url(url)
-            instructions = (
-                f"🔒 **Instagram Protected Content**\n"
-                f"Direct access blocked by Instagram security checks.\n\n"
-                f"1. Open this link in your browser:\n`{api_url}`\n\n"
-                f"2. Select all text and copy (**Ctrl+A** then **Ctrl+C**).\n"
-                f"3. **Paste/Upload text data layout** back into this chat window."
-            )
-            await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
-        else:
-            await msg.edit_text(f"❌ *Scraping failure:* `{clean_errors(str(e))}`", parse_mode="Markdown")
+        await msg.edit_text(f"❌ *Scraping failure:* `{clean_errors(str(e))}`", parse_mode="Markdown")
         return
 
     if is_image_post(info):
@@ -539,15 +524,6 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     heights = get_available_heights(info)
-    if "instagram.com" in url:
-        ctx.user_data[url_key] = {"url": url, "is_raw": False}
-        await msg.edit_text(
-            f"📦 **{site} Data Layout Verified**\nSelect your download target option:",
-            reply_markup=build_dynamic_instagram_keyboard(url_key, 0, 1),
-            parse_mode="Markdown"
-        )
-        return
-
     preset_selectors = [
         selector for label, selector in QUALITY_PRESETS
         if (m := re.search(r"height<=(\d+)", selector)) and any(h <= int(m.group(1)) for h in heights)
