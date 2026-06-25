@@ -360,7 +360,6 @@ def _resolve_instagram_user_id(username: str, cookies_path: "Path | None" = None
             return str(uid)
     except Exception:
         pass
-    # Fallback: scrape public profile HTML
     return _scrape_instagram_user_id(username)
 
 
@@ -427,6 +426,50 @@ def _execute_graphql(
         return None
 
 
+def _extract_story_media_url(item: dict) -> "tuple[str | None, str]":
+    """
+    Extract (media_url, ext) from a story item.
+
+    Story GraphQL responses use:
+      - video_resources[].src  (videos)
+      - display_url            (thumbnail / image fallback)
+      - display_resources[].src (image fallback)
+
+    NOT video_versions / image_versions2 (those are the private API fields).
+    """
+    # ── Video ────────────────────────────────────────────────────────────────
+    if item.get("is_video"):
+        video_resources = item.get("video_resources") or item.get("video_versions") or []
+        for vr in video_resources:
+            url = vr.get("src") or vr.get("url")
+            if url:
+                return url, ".mp4"
+
+    # ── Image / thumbnail ────────────────────────────────────────────────────
+    display_resources = item.get("display_resources") or []
+
+    # Prefer the highest-res display_resource
+    if display_resources:
+        best = max(display_resources, key=lambda r: r.get("config_width", 0))
+        url = best.get("src") or best.get("url")
+        if url:
+            return url, ".jpg"
+
+    # Plain display_url
+    url = item.get("display_url")
+    if url:
+        return url, ".jpg"
+
+    # Last resort: image_versions2 (private API shape)
+    iv2 = item.get("image_versions2")
+    if isinstance(iv2, dict):
+        candidates = iv2.get("candidates") or []
+        if candidates:
+            return candidates[0].get("url"), ".jpg"
+
+    return None, ".jpg"
+
+
 def fetch_instagram_post_graphql(url: str, url_key: str) -> "list[Path]":
     """
     Fetch a private/rate-limited post directly via GraphQL.
@@ -480,13 +523,10 @@ def fetch_instagram_post_graphql(url: str, url_key: str) -> "list[Path]":
 def fetch_instagram_stories(url: str, url_key: str) -> list[Path]:
     """
     Private-story aware fetcher using the reels_media query_hash endpoint.
-    reel_ids MUST be a numeric integer ID — not a username string.
 
-    Strategy:
-      1. Resolve username -> numeric user_id (API first, HTML scrape fallback).
-      2. Build query_hash URL with int(user_id) in reel_ids.
-      3. Execute with authenticated headers.
-      4. Parse and download items.
+    reel_ids MUST be a numeric integer — not a username string.
+    Media fields in story responses use video_resources/display_resources,
+    not video_versions/image_versions2.
     """
     cookies = get_cookies_path()
 
@@ -514,9 +554,7 @@ def fetch_instagram_stories(url: str, url_key: str) -> list[Path]:
 
     reels_media = (
         payload.get("data", {}).get("reels_media")
-        or payload.get("data", {})
-                   .get("xdt_api__v1__feed__reels_media__connection", {})
-                   .get("reels_media")
+        or payload.get("data", {}).get("xdt_api__v1__feed__reels_media__connection", {}).get("reels_media")
         or []
     )
     if not reels_media:
@@ -534,24 +572,16 @@ def fetch_instagram_stories(url: str, url_key: str) -> list[Path]:
 
     downloaded: list[Path] = []
     for idx, item in enumerate(items):
-        vid_candidates = item.get("video_versions") or []
-        img_candidates = (
-            item.get("image_versions2", {}).get("candidates", [])
-            if isinstance(item.get("image_versions2"), dict) else []
-        )
-        media_url = (
-            vid_candidates[0].get("url") if vid_candidates
-            else (img_candidates[0].get("url") if img_candidates else None)
-        )
+        media_url, ext = _extract_story_media_url(item)
         if not media_url:
             continue
-        ext = ".mp4" if vid_candidates else ".jpg"
         dest = DOWNLOAD_DIR / f"{url_key}_{idx:03d}{ext}"
         try:
             urllib.request.urlretrieve(media_url, dest)
             downloaded.append(dest)
         except Exception:
             continue
+
     return downloaded
 
 
