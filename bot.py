@@ -480,6 +480,26 @@ async def handle_image_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def drop_existing_session() -> None:
+    """
+    Flush any lingering long-poll connection from a previous instance.
+    deleteWebhook clears webhook mode; the getUpdates with timeout=0
+    forces Telegram to close any open long-poll held by the old process.
+    Both are best-effort — failures are logged but never fatal.
+    """
+    import urllib.request
+    base = f"https://api.telegram.org/bot{BOT_TOKEN}"
+    for label, url in (
+        ("deleteWebhook", f"{base}/deleteWebhook?drop_pending_updates=true"),
+        ("getUpdates",    f"{base}/getUpdates?offset=-1&limit=1&timeout=0"),
+    ):
+        try:
+            urllib.request.urlopen(url, timeout=10)
+            print(f"✅ Pre-start {label} OK")
+        except Exception as e:
+            print(f"⚠️  Pre-start {label}: {e}")
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN environment variable is not set")
@@ -493,7 +513,20 @@ def main() -> None:
     else:
         print("⚠️  No cookies file found — some sites may require login")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Evict any old long-poll / webhook before starting our own
+    print("🔄 Dropping any existing session…")
+    drop_existing_session()
+    import time; time.sleep(2)  # give Telegram a moment to release the old connection
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help",  start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
@@ -501,7 +534,11 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_image_download, pattern=r"^img\|"))
 
     print("🤖 Bot polling…")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query"],
+    )
+
 
 if __name__ == "__main__":
     main()
