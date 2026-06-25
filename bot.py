@@ -630,7 +630,24 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         fmt_arg = presets[idx] if idx < len(presets) else "bestvideo+bestaudio/best"
         is_audio = False
 
-    await query.edit_message_text("⬇️ Downloading… please wait.")
+    await query.edit_message_text("📤 Uploading to Telegram…")
+    try:
+        with open(filepath, "rb") as f:
+            if is_audio:
+                await query.message.reply_audio(audio=f, filename=filepath.name,
+                                                read_timeout=300, write_timeout=300, connect_timeout=60)
+            else:
+                # Add explicit timeouts and streaming parameters for stubborn files
+                await query.message.reply_video(
+                    video=f, 
+                    filename=filepath.name,
+                    supports_streaming=True,
+                    read_timeout=600,   # Bumped up significantly
+                    write_timeout=600,  # Bumped up significantly
+                    connect_timeout=120,
+                    pool_timeout=120
+                )
+        await query.delete_message()
 
     out = str(DOWNLOAD_DIR / f"{url_key}_%(title).60s.%(ext)s")
     dl_args = base_args(url) + [
