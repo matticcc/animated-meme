@@ -41,10 +41,10 @@ KNOWN_SITES: dict[str, str] = {
     "instagram.com": "Instagram",
 }
 
-ALLOWED_DOMAINS    = set(KNOWN_SITES.keys())
-YOUTUBE_DOMAINS    = {"youtube.com", "youtu.be"}
+ALLOWED_DOMAINS     = set(KNOWN_SITES.keys())
+YOUTUBE_DOMAINS     = {"youtube.com", "youtu.be"}
 IMAGE_CAPABLE_SITES = {"tiktok.com", "instagram.com"}
-IMAGE_EXTS         = {".jpg", ".jpeg", ".png", ".webp"}
+IMAGE_EXTS          = {".jpg", ".jpeg", ".png", ".webp"}
 
 QUALITY_PRESETS = [
     ("4K (2160p)", "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best"),
@@ -80,7 +80,7 @@ def run_health_server():
     HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
 
 
-# ── yt-dlp / gallery-dl helpers ───────────────────────────────────────────────
+# ── Download helpers ───────────────────────────────────────────────────────────
 
 def is_allowed_site(url: str) -> bool:
     return any(d in url.lower() for d in ALLOWED_DOMAINS)
@@ -113,7 +113,6 @@ def run_ytdlp(args: list[str]) -> tuple[str, str, int]:
     return result.stdout, result.stderr, result.returncode
 
 def run_gallerydl(url: str, out_dir: Path) -> tuple[str, str, int]:
-    """Download images with gallery-dl into out_dir."""
     result = subprocess.run(
         ["gallery-dl", "--dest", str(out_dir), url],
         capture_output=True, text=True, timeout=300,
@@ -128,65 +127,29 @@ def is_tiktok_photo_url(url: str) -> bool:
     return "tiktok.com" in url.lower() and "/photo/" in url.lower()
 
 def probe_url(url: str) -> dict:
-    """
-    Return yt-dlp JSON info dict. For TikTok /photo/ URLs, yt-dlp can't probe
-    them, so we return a synthetic dict flagged for gallery-dl handling.
-    """
+    """Return yt-dlp JSON info. TikTok /photo/ URLs go straight to gallery-dl."""
     if is_tiktok_photo_url(url):
-        # yt-dlp doesn't support TikTok photo slideshows — mark for gallery-dl
         return {"_use_gallerydl": True, "url": url}
-
     stdout, stderr, code = run_ytdlp(base_args(url) + ["-J", url])
     if code != 0:
         err = clean_errors(stderr)
-        # If yt-dlp itself says unsupported, flag for gallery-dl if image-capable site
         if "Unsupported URL" in err and is_image_capable(url):
             return {"_use_gallerydl": True, "url": url}
         raise RuntimeError(err)
     return json.loads(stdout)
 
-def extract_image_entries(info: dict) -> list[dict]:
-    """
-    Return a flat list of image entry dicts from a yt-dlp info blob.
-    Each entry has at minimum: url (direct image URL), ext, index (1-based).
-    """
-    entries = []
-
-    def _add(e: dict, idx: int):
-        # yt-dlp image posts store the direct URL in 'url' field
-        direct = e.get("url") or e.get("webpage_url", "")
-        ext = e.get("ext", "jpg")
-        title = e.get("title") or e.get("id") or f"image_{idx}"
-        entries.append({"url": direct, "ext": ext, "title": title, "index": idx})
-
-    top_entries = info.get("entries")
-    if top_entries:
-        for i, e in enumerate(top_entries, 1):
-            _add(e, i)
-    else:
-        _add(info, 1)
-
-    return entries
-
 def is_image_post(info: dict) -> bool:
-    """True when the probed info represents a photo/slideshow post."""
     if info.get("_use_gallerydl"):
         return True
-
-    def _entry_is_image(e: dict) -> bool:
-        ext = e.get("ext", "")
-        if ext in ("jpg", "jpeg", "png", "webp"):
+    def _is_image(e: dict) -> bool:
+        if e.get("ext", "") in ("jpg", "jpeg", "png", "webp"):
             return True
-        # no video codec and no duration → treat as image
         vcodec = e.get("vcodec", "none") or "none"
-        if vcodec == "none" and not e.get("duration"):
-            return True
-        return False
-
+        return vcodec == "none" and not e.get("duration")
     entries = info.get("entries")
     if entries:
-        return all(_entry_is_image(e) for e in entries)
-    return _entry_is_image(info)
+        return all(_is_image(e) for e in entries)
+    return _is_image(info)
 
 def get_available_heights(info: dict) -> list[int]:
     heights: set[int] = set()
@@ -197,10 +160,11 @@ def get_available_heights(info: dict) -> list[int]:
     return sorted(heights, reverse=True)
 
 def find_downloaded_file(url_key: str) -> Path | None:
+    """Find a single downloaded video file, waiting for yt-dlp to finish merging."""
     for _ in range(10):
         candidates = [
             p for p in DOWNLOAD_DIR.glob(f"{url_key}_*")
-            if p.suffix not in (".part", ".ytdl") and not p.name.endswith(".part")
+            if not p.name.endswith((".part", ".ytdl"))
         ]
         if candidates:
             return candidates[0]
@@ -208,12 +172,47 @@ def find_downloaded_file(url_key: str) -> Path | None:
     return None
 
 def collect_image_files(url_key: str) -> list[Path]:
-    """Collect all non-temp image files downloaded for url_key, sorted."""
-    files = sorted([
+    """Return sorted list of downloaded image files for this url_key."""
+    return sorted([
         p for p in DOWNLOAD_DIR.glob(f"{url_key}_*")
         if p.suffix.lower() in IMAGE_EXTS and not p.name.endswith((".part", ".ytdl"))
     ])
-    return files
+
+def download_images(url: str, url_key: str) -> list[Path]:
+    """
+    Download all images from an image post.
+    Tries yt-dlp first; falls back to gallery-dl if that fails or yields nothing.
+    Returns sorted list of downloaded image Paths.
+    """
+    out_tpl = str(DOWNLOAD_DIR / f"{url_key}_%(autonumber)03d.%(ext)s")
+
+    # Try yt-dlp first (works for Instagram carousels and some TikTok slideshows)
+    if not is_tiktok_photo_url(url):
+        _, stderr, code = run_ytdlp(base_args(url) + ["-o", out_tpl, url])
+        files = collect_image_files(url_key)
+        if files:
+            return files
+
+    # Fall back to gallery-dl (handles TikTok /photo/ and anything yt-dlp missed)
+    sub = DOWNLOAD_DIR / url_key
+    sub.mkdir(exist_ok=True)
+    run_gallerydl(url, sub)
+
+    gdl_files = sorted([
+        p for p in sub.rglob("*")
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+    ])
+    moved = []
+    for i, fp in enumerate(gdl_files):
+        dest = DOWNLOAD_DIR / f"{url_key}_{i:03d}{fp.suffix}"
+        fp.rename(dest)
+        moved.append(dest)
+    try:
+        sub.rmdir()
+    except Exception:
+        pass
+
+    return moved if moved else collect_image_files(url_key)
 
 
 # ── Keyboard builders ──────────────────────────────────────────────────────────
@@ -227,73 +226,23 @@ def build_video_keyboard(url_key: str, heights: list[int]) -> InlineKeyboardMark
     buttons.append([InlineKeyboardButton("🎵 Audio only (best)", callback_data=f"dl|{url_key}|audio")])
     return InlineKeyboardMarkup(buttons)
 
-def build_image_picker_keyboard(url_key: str, count: int) -> InlineKeyboardMarkup:
-    """
-    Show one button per photo + an 'All photos' button.
-    callback_data: img|<url_key>|all  or  img|<url_key>|<0-based-index>
-    """
-    buttons = [[InlineKeyboardButton("📸 All photos", callback_data=f"img|{url_key}|all")]]
+def build_photo_picker(url_key: str, count: int) -> InlineKeyboardMarkup:
+    """Picker shown AFTER download, with actual file count."""
+    buttons = [[InlineKeyboardButton("📸 All photos", callback_data=f"pick|{url_key}|all")]]
     for i in range(count):
-        buttons.append([InlineKeyboardButton(f"Photo {i + 1}", callback_data=f"img|{url_key}|{i}")])
+        buttons.append([InlineKeyboardButton(f"Photo {i + 1}", callback_data=f"pick|{url_key}|{i}")])
     return InlineKeyboardMarkup(buttons)
-
-
-# ── Download helpers ───────────────────────────────────────────────────────────
-
-def download_images_gallerydl(url: str, url_key: str) -> list[Path]:
-    """
-    Use gallery-dl to download a TikTok/Instagram photo post.
-    Files are saved into a per-key subdirectory then moved up.
-    """
-    sub = DOWNLOAD_DIR / url_key
-    sub.mkdir(exist_ok=True)
-    run_gallerydl(url, sub)
-    files = sorted([
-        p for p in sub.rglob("*")
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTS
-    ])
-    # Move files into DOWNLOAD_DIR with url_key prefix
-    moved = []
-    for i, fp in enumerate(files):
-        dest = DOWNLOAD_DIR / f"{url_key}_{i:03d}{fp.suffix}"
-        fp.rename(dest)
-        moved.append(dest)
-    # Clean up empty subdir
-    try:
-        sub.rmdir()
-    except Exception:
-        pass
-    return moved
-
-def download_image_by_index_ytdlp(url: str, url_key: str, entry: dict) -> Path | None:
-    """Download a single image entry already probed by yt-dlp."""
-    img_url = entry.get("url", "")
-    if not img_url:
-        return None
-    ext = entry.get("ext", "jpg")
-    dest = DOWNLOAD_DIR / f"{url_key}_single.{ext}"
-    # Use yt-dlp to re-download by direct URL, or just wget it
-    result = subprocess.run(
-        ["yt-dlp", "--no-warnings", "-o", str(dest), img_url],
-        capture_output=True, text=True, timeout=120,
-    )
-    if result.returncode != 0 or not dest.exists():
-        # Try plain wget/curl as last resort
-        subprocess.run(["curl", "-sL", "-o", str(dest), img_url], timeout=60)
-    return dest if dest.exists() else None
 
 
 # ── Telegram upload helpers ────────────────────────────────────────────────────
 
 async def send_photos(message, files: list[Path]) -> None:
-    """Send one or multiple photos to a Telegram message, handling batching."""
     if not files:
         return
     if len(files) == 1:
         with open(files[0], "rb") as f:
             await message.reply_photo(photo=f, read_timeout=120, write_timeout=120, connect_timeout=30)
         return
-    # Send in batches of 10 (Telegram media group limit)
     for batch_start in range(0, len(files), 10):
         batch = files[batch_start:batch_start + 10]
         opened = [open(fp, "rb") for fp in batch]
@@ -317,6 +266,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="Markdown",
     )
 
+
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     url = extract_url(update.message.text or "")
     if not url:
@@ -325,22 +275,80 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not is_allowed_site(url):
         await update.message.reply_text(
-            "❌ *Unsupported site.*\n\n"
-            "I only accept links from:\n"
-            "• YouTube\n"
-            "• TikTok\n"
-            "• Reddit\n"
-            "• RedGifs\n"
-            "• Instagram",
+            "❌ *Unsupported site.*\n\nI only accept links from:\n"
+            "• YouTube\n• TikTok\n• Reddit\n• RedGifs\n• Instagram",
             parse_mode="Markdown",
         )
         return
 
     site = detect_site(url)
-    msg = await update.message.reply_text(
-        f"🔍 Fetching info from *{site}*…", parse_mode="Markdown"
-    )
+    msg = await update.message.reply_text(f"🔍 Fetching info from *{site}*…", parse_mode="Markdown")
 
+    # ── Image post: download immediately, then show picker ──
+    if is_image_capable(url):
+        try:
+            info = await asyncio.get_event_loop().run_in_executor(None, probe_url, url)
+        except Exception as e:
+            await msg.edit_text(f"❌ *Error:*\n`{clean_errors(str(e))}`", parse_mode="Markdown")
+            return
+
+        if is_image_post(info):
+            url_key = str(msg.message_id)
+            await msg.edit_text(f"⬇️ Downloading photos from *{site}*…", parse_mode="Markdown")
+
+            try:
+                files = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: download_images(url, url_key)
+                )
+            except Exception as e:
+                await msg.edit_text(f"❌ *Download error:*\n`{str(e)}`", parse_mode="Markdown")
+                return
+
+            if not files:
+                await msg.edit_text("❌ No photos found. The post may be private or unsupported.")
+                return
+
+            # Store file paths — they're already on disk, picker just sends them
+            ctx.user_data[url_key] = {"files": [str(p) for p in files]}
+
+            if len(files) == 1:
+                # Only one photo: skip picker, send immediately
+                await msg.edit_text("📤 Uploading…")
+                try:
+                    await send_photos(update.message, files)
+                    await msg.delete()
+                except (TimedOut, NetworkError):
+                    await msg.edit_text("❌ Upload timed out. Please try again.")
+                except Exception as e:
+                    await msg.edit_text(f"❌ Upload error:\n`{e}`", parse_mode="Markdown")
+                finally:
+                    for fp in files:
+                        fp.unlink(missing_ok=True)
+                    ctx.user_data.pop(url_key, None)
+            else:
+                await msg.edit_text(
+                    f"🖼 *{len(files)} photos* downloaded. Which do you want to send?",
+                    reply_markup=build_photo_picker(url_key, len(files)),
+                    parse_mode="Markdown",
+                )
+            return
+
+        # Image-capable site but it's actually a video — fall through to video path
+        url_key = str(msg.message_id)
+        heights = get_available_heights(info)
+        preset_selectors = [
+            selector for label, selector in QUALITY_PRESETS
+            if (m := re.search(r"height<=(\d+)", selector)) and any(h <= int(m.group(1)) for h in heights)
+        ]
+        ctx.user_data[url_key] = {"url": url, "type": "video", "presets": preset_selectors}
+        await msg.edit_text(
+            f"📺 *{site}* — choose quality:\n_(audio always at best quality)_",
+            reply_markup=build_video_keyboard(url_key, heights),
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── Non-image-capable site: probe for video ──
     try:
         info = await asyncio.get_event_loop().run_in_executor(None, probe_url, url)
     except Exception as e:
@@ -348,41 +356,11 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     url_key = str(msg.message_id)
-
-    # ── Image / slideshow path ──
-    if is_image_capable(url) and is_image_post(info):
-        use_gdl = info.get("_use_gallerydl", False)
-
-        if use_gdl:
-            # gallery-dl path: we don't know count yet, download all at click time
-            ctx.user_data[url_key] = {"url": url, "type": "gdl_image"}
-            await msg.edit_text(
-                f"🖼 *{site}* — photo slideshow detected.\n\nChoose what to download:",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📸 Download all photos", callback_data=f"gdl|{url_key}|all")
-                ]]),
-                parse_mode="Markdown",
-            )
-        else:
-            # yt-dlp path: we have entries, show per-photo picker
-            entries = extract_image_entries(info)
-            ctx.user_data[url_key] = {"url": url, "type": "yt_image", "entries": entries}
-            count = len(entries)
-            await msg.edit_text(
-                f"🖼 *{site}* — {count} photo{'s' if count != 1 else ''} found.\n\nChoose what to download:",
-                reply_markup=build_image_picker_keyboard(url_key, count),
-                parse_mode="Markdown",
-            )
-        return
-
-    # ── Video path ──
     heights = get_available_heights(info)
-    preset_selectors = []
-    for label, selector in QUALITY_PRESETS:
-        m = re.search(r"height<=(\d+)", selector)
-        if m and any(h <= int(m.group(1)) for h in heights):
-            preset_selectors.append(selector)
-
+    preset_selectors = [
+        selector for label, selector in QUALITY_PRESETS
+        if (m := re.search(r"height<=(\d+)", selector)) and any(h <= int(m.group(1)) for h in heights)
+    ]
     ctx.user_data[url_key] = {"url": url, "type": "video", "presets": preset_selectors}
     await msg.edit_text(
         f"📺 *{site}* — choose quality:\n_(audio always at best quality)_",
@@ -391,8 +369,50 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def handle_photo_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    User picked a photo (or all) from the post-download picker.
+    callback_data: pick|<url_key>|all  or  pick|<url_key>|<0-based index>
+    """
+    query = update.callback_query
+    await query.answer()
+
+    _, url_key, choice = query.data.split("|", 2)
+    data = ctx.user_data.get(url_key)
+    if not data:
+        await query.edit_message_text("❌ Session expired. Send the URL again.")
+        return
+
+    all_files = [Path(p) for p in data.get("files", [])]
+    # Filter to files that still exist on disk
+    all_files = [p for p in all_files if p.exists()]
+    if not all_files:
+        await query.edit_message_text("❌ Files no longer available. Send the URL again.")
+        return
+
+    if choice == "all":
+        selected = all_files
+    else:
+        idx = int(choice)
+        selected = [all_files[idx]] if idx < len(all_files) else all_files
+
+    await query.edit_message_text(f"📤 Uploading {len(selected)} photo(s)…")
+    try:
+        await send_photos(query.message, selected)
+        await query.delete_message()
+    except (TimedOut, NetworkError):
+        await query.edit_message_text("❌ Upload timed out. Please try again.")
+    except Exception as e:
+        await query.edit_message_text(f"❌ Upload error:\n`{e}`", parse_mode="Markdown")
+    finally:
+        # Clean up all files once user has made their pick (or on error)
+        for fp in all_files:
+            fp.unlink(missing_ok=True)
+        ctx.user_data.pop(url_key, None)
+
+
 async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Video / audio download handler."""
+    """Video / audio quality button handler."""
     query = update.callback_query
     await query.answer()
 
@@ -446,7 +466,7 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     if size_bytes > TELEGRAM_MAX_BYTES:
         filepath.unlink(missing_ok=True)
         await query.edit_message_text(
-            f"❌ File too large ({size_bytes // 1024 // 1024} MB > {MAX_FILESIZE_MB} MB limit). Try a lower quality."
+            f"❌ File too large ({size_bytes // 1024 // 1024} MB > {MAX_FILESIZE_MB} MB). Try a lower quality."
         )
         return
 
@@ -463,208 +483,12 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await query.delete_message()
     except (TimedOut, NetworkError):
         await query.edit_message_text(
-            f"❌ Upload timed out — file was {size_bytes // 1024 // 1024} MB. Try a lower quality or retry."
+            f"❌ Upload timed out ({size_bytes // 1024 // 1024} MB). Try a lower quality or retry."
         )
     except Exception as e:
         await query.edit_message_text(f"❌ Upload error:\n`{e}`", parse_mode="Markdown")
     finally:
         filepath.unlink(missing_ok=True)
-        ctx.user_data.pop(url_key, None)
-
-
-async def handle_image_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles photo picker buttons for yt-dlp image posts (Instagram carousels,
-    TikTok slideshows that yt-dlp supports).
-    callback_data: img|<url_key>|all  or  img|<url_key>|<0-based-index>
-    """
-    query = update.callback_query
-    await query.answer()
-
-    _, url_key, choice = query.data.split("|", 2)
-    data = ctx.user_data.get(url_key)
-    if not data:
-        await query.edit_message_text("❌ Session expired. Send the URL again.")
-        return
-
-    url     = data["url"]
-    entries = data.get("entries", [])
-
-    if choice == "all":
-        targets = entries
-    else:
-        idx = int(choice)
-        if idx >= len(entries):
-            await query.edit_message_text("❌ Invalid selection.")
-            return
-        targets = [entries[idx]]
-
-    await query.edit_message_text(f"⬇️ Downloading {len(targets)} photo(s)…")
-
-    # Download each selected entry
-    out_tpl = str(DOWNLOAD_DIR / f"{url_key}_%(autonumber)03d.%(ext)s")
-    dl_args = base_args(url) + [
-        "--no-warnings",
-        "-o", out_tpl,
-        url,
-    ]
-
-    try:
-        _, stderr, code = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: run_ytdlp(dl_args)
-        )
-        if code != 0:
-            raise RuntimeError(clean_errors(stderr))
-    except Exception as e:
-        await query.edit_message_text(f"❌ *Download error:*\n`{str(e)}`", parse_mode="Markdown")
-        return
-
-    all_files = collect_image_files(url_key)
-
-    # If the user picked specific photos, filter to just those (1-based indices)
-    if choice != "all":
-        idx = int(choice)
-        # Files are sorted; pick the one at position idx
-        if idx < len(all_files):
-            selected = [all_files[idx]]
-        else:
-            selected = all_files  # fallback: send all
-    else:
-        selected = all_files
-
-    if not selected:
-        # Maybe yt-dlp saved a video file (slideshow with bgm) — try video path
-        video_files = [
-            p for p in DOWNLOAD_DIR.glob(f"{url_key}_*")
-            if p.suffix.lower() not in IMAGE_EXTS and not p.name.endswith((".part", ".ytdl"))
-        ]
-        if video_files:
-            fp = video_files[0]
-            await query.edit_message_text("📤 Uploading…")
-            try:
-                with open(fp, "rb") as f:
-                    await query.message.reply_video(video=f, filename=fp.name, supports_streaming=True,
-                                                    read_timeout=300, write_timeout=300, connect_timeout=60)
-                await query.delete_message()
-            except Exception as e:
-                await query.edit_message_text(f"❌ Upload error:\n`{e}`", parse_mode="Markdown")
-            finally:
-                fp.unlink(missing_ok=True)
-                ctx.user_data.pop(url_key, None)
-            return
-        await query.edit_message_text("❌ No image files found after download.")
-        return
-
-    await query.edit_message_text(f"📤 Uploading {len(selected)} photo(s)…")
-    try:
-        await send_photos(query.message, selected)
-        await query.delete_message()
-    except (TimedOut, NetworkError):
-        await query.edit_message_text("❌ Upload timed out. Please try again.")
-    except Exception as e:
-        await query.edit_message_text(f"❌ Upload error:\n`{e}`", parse_mode="Markdown")
-    finally:
-        for fp in collect_image_files(url_key):
-            fp.unlink(missing_ok=True)
-        ctx.user_data.pop(url_key, None)
-
-
-async def handle_gdl_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    gallery-dl handler for TikTok /photo/ URLs and any other URL yt-dlp can't probe.
-    callback_data: gdl|<url_key>|all
-    (individual photo selection is not possible before download with gallery-dl,
-    but after download we show per-photo buttons if there are multiple)
-    """
-    query = update.callback_query
-    await query.answer()
-
-    _, url_key, choice = query.data.split("|", 2)
-    data = ctx.user_data.get(url_key)
-    if not data:
-        await query.edit_message_text("❌ Session expired. Send the URL again.")
-        return
-
-    url = data["url"]
-
-    await query.edit_message_text("⬇️ Downloading photos…")
-
-    try:
-        files = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: download_images_gallerydl(url, url_key)
-        )
-    except Exception as e:
-        await query.edit_message_text(f"❌ *Download error:*\n`{str(e)}`", parse_mode="Markdown")
-        return
-
-    if not files:
-        await query.edit_message_text("❌ No photos found. The post may be private or unsupported.")
-        return
-
-    # If multiple photos, ask user which one(s) they want
-    if len(files) > 1:
-        # Store file paths in user_data for the picker
-        ctx.user_data[url_key]["gdl_files"] = [str(p) for p in files]
-        buttons = [[InlineKeyboardButton("📸 All photos", callback_data=f"gdlpick|{url_key}|all")]]
-        for i in range(len(files)):
-            buttons.append([InlineKeyboardButton(f"Photo {i + 1}", callback_data=f"gdlpick|{url_key}|{i}")])
-        await query.edit_message_text(
-            f"🖼 {len(files)} photos downloaded. Choose which to send:",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-        return
-
-    # Single photo: send immediately
-    await query.edit_message_text("📤 Uploading…")
-    try:
-        await send_photos(query.message, files)
-        await query.delete_message()
-    except (TimedOut, NetworkError):
-        await query.edit_message_text("❌ Upload timed out. Please try again.")
-    except Exception as e:
-        await query.edit_message_text(f"❌ Upload error:\n`{e}`", parse_mode="Markdown")
-    finally:
-        for fp in files:
-            fp.unlink(missing_ok=True)
-        ctx.user_data.pop(url_key, None)
-
-
-async def handle_gdl_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles photo picker after gallery-dl has already downloaded all files.
-    callback_data: gdlpick|<url_key>|all  or  gdlpick|<url_key>|<index>
-    """
-    query = update.callback_query
-    await query.answer()
-
-    _, url_key, choice = query.data.split("|", 2)
-    data = ctx.user_data.get(url_key)
-    if not data:
-        await query.edit_message_text("❌ Session expired.")
-        return
-
-    all_paths = [Path(p) for p in data.get("gdl_files", [])]
-    if not all_paths:
-        await query.edit_message_text("❌ Files no longer available. Send the URL again.")
-        return
-
-    if choice == "all":
-        selected = all_paths
-    else:
-        idx = int(choice)
-        selected = [all_paths[idx]] if idx < len(all_paths) else all_paths
-
-    await query.edit_message_text(f"📤 Uploading {len(selected)} photo(s)…")
-    try:
-        await send_photos(query.message, selected)
-        await query.delete_message()
-    except (TimedOut, NetworkError):
-        await query.edit_message_text("❌ Upload timed out. Please try again.")
-    except Exception as e:
-        await query.edit_message_text(f"❌ Upload error:\n`{e}`", parse_mode="Markdown")
-    finally:
-        for fp in all_paths:
-            fp.unlink(missing_ok=True)
         ctx.user_data.pop(url_key, None)
 
 
@@ -694,7 +518,7 @@ def main() -> None:
     print(f"✅ Health server on :{PORT}")
 
     cp = get_cookies_path()
-    print(f"✅ Cookies: {cp}" if cp else "⚠️  No cookies file found — some sites may require login")
+    print(f"✅ Cookies: {cp}" if cp else "⚠️  No cookies file — some sites may require login")
 
     print("🔄 Dropping any existing session…")
     drop_existing_session()
@@ -712,10 +536,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help",  start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    app.add_handler(CallbackQueryHandler(handle_download,    pattern=r"^dl\|"))
-    app.add_handler(CallbackQueryHandler(handle_image_pick,  pattern=r"^img\|"))
-    app.add_handler(CallbackQueryHandler(handle_gdl_download, pattern=r"^gdl\|"))
-    app.add_handler(CallbackQueryHandler(handle_gdl_pick,    pattern=r"^gdlpick\|"))
+    app.add_handler(CallbackQueryHandler(handle_download,   pattern=r"^dl\|"))
+    app.add_handler(CallbackQueryHandler(handle_photo_pick, pattern=r"^pick\|"))
 
     print("🤖 Bot polling…")
     app.run_polling(
