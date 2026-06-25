@@ -519,7 +519,13 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         idx = int(choice)
         h = presets[idx] if idx < len(presets) else "1080"
-        fmt_arg = f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={h}]+bestaudio/best"
+        # Bulletproof fallback string: tries ideal combinations, then falls back to ANY available resolution if blocked
+        fmt_arg = (
+            f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={h}]+bestaudio/"
+            f"best[height<={h}]/"
+            f"best"
+        )
         is_audio = False
 
     await query.edit_message_text("⬇️ Compiling media payload files...")
