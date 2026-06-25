@@ -39,6 +39,10 @@ INSTAGRAM_POST_DOC_ID  = os.environ.get("INSTAGRAM_POST_DOC_ID", "").strip()
 INSTAGRAM_STORY_DOC_ID = os.environ.get("INSTAGRAM_STORY_DOC_ID", "").strip()
 INSTAGRAM_APP_ID       = os.environ.get("INSTAGRAM_APP_ID", "936619743392459").strip()
 
+INSTAGRAM_POST_DOC_ID   = os.environ.get("INSTAGRAM_POST_DOC_ID", "").strip()
+INSTAGRAM_STORY_QUERY_HASH = os.environ.get("INSTAGRAM_STORY_QUERY_HASH", "de8017ee0a7c9c45ec4260733d81ea31").strip()
+INSTAGRAM_APP_ID         = os.environ.get("INSTAGRAM_APP_ID", "936619743392459").strip()
+
 KNOWN_SITES: dict[str, str] = {
     "tiktok.com":  "TikTok",
     "redgifs.com": "RedGifs",
@@ -322,10 +326,7 @@ def _resolve_instagram_user_id(username: str, cookies_path: "Path | None" = None
 
 
 def _scrape_post_doc_id(shortcode: str) -> "str | None":
-    """
-    Fetch the post page HTML and grep for a doc_id.
-    Returns the scraped value or None on failure.
-    """
+    """Scrape the post page HTML for a live doc_id. Returns None on failure."""
     try:
         req = urllib.request.Request(
             f"https://www.instagram.com/p/{shortcode}/",
@@ -346,45 +347,36 @@ def _scrape_post_doc_id(shortcode: str) -> "str | None":
         return None
 
 
-def _scrape_story_doc_id(username: str) -> "str | None":
+def _build_story_query_url(user_id: str) -> str:
     """
-    Fetch the stories page HTML and grep for a reels/story doc_id.
-    Tries progressively looser patterns; returns None on failure.
+    Build the Instagram stories GraphQL URL.
+
+    Uses query_hash (the format Instagram's own web app uses for reels_media).
+    INSTAGRAM_STORY_QUERY_HASH env var — defaults to the known working value
+    de8017ee0a7c9c45ec4260733d81ea31 which is stable across months unlike doc_id.
     """
-    try:
-        req = urllib.request.Request(
-            f"https://www.instagram.com/stories/{urllib.parse.quote(username)}/",
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-                    "Mobile/15E148 Safari/604.1"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        for pattern in [
-            r'reels_media.{0,200}"doc_id"\s*:\s*"?(\d{10,})"?',
-            r'story.{0,200}"doc_id"\s*:\s*"?(\d{10,})"?',
-            r'"doc_id"\s*:\s*"?(\d{10,})"?',
-        ]:
-            m = re.search(pattern, html, re.DOTALL)
-            if m:
-                return m.group(1)
-        return None
-    except Exception:
-        return None
+    variables = {
+        "reel_ids": [user_id],
+        "highlight_reel_ids": [],
+        "precomposed_overlay": False,
+    }
+    encoded = urllib.parse.quote(json.dumps(variables, separators=(",", ":")))
+    return (
+        f"https://www.instagram.com/graphql/query/"
+        f"?query_hash={INSTAGRAM_STORY_QUERY_HASH}&variables={encoded}"
+    )
 
 
-def _execute_graphql(doc_id: str, variables: dict, cookies_path: "Path | None" = None) -> "dict | None":
+def _execute_graphql(doc_id_or_hash: str, variables: dict,
+                     cookies_path: "Path | None" = None,
+                     use_query_hash: bool = False) -> "dict | None":
     """
-    Fire a GraphQL query against the Instagram endpoint and return the parsed JSON.
-    Returns None on any network/parse error.
+    Fire a GraphQL query against the Instagram endpoint and return parsed JSON.
+    Supports both doc_id and query_hash formats.
     """
     encoded = urllib.parse.quote(json.dumps(variables, separators=(",", ":")))
-    url = f"https://www.instagram.com/graphql/query/?doc_id={doc_id}&variables={encoded}"
+    param = "query_hash" if use_query_hash else "doc_id"
+    url = f"https://www.instagram.com/graphql/query/?{param}={doc_id_or_hash}&variables={encoded}"
     req = urllib.request.Request(url, headers=_build_ig_headers(cookies_path))
     try:
         with urllib.request.urlopen(req, timeout=25) as resp:
@@ -396,12 +388,7 @@ def _execute_graphql(doc_id: str, variables: dict, cookies_path: "Path | None" =
 def fetch_instagram_post_graphql(url: str, url_key: str) -> "list[Path]":
     """
     Fetch a private/rate-limited post directly via GraphQL.
-
-    doc_id resolution order:
-      1. Scrape the post page for a live doc_id.
-      2. Fall back to INSTAGRAM_POST_DOC_ID env var.
-
-    Returns a list of downloaded Paths, or [] on failure.
+    doc_id: scrape post page first, fall back to INSTAGRAM_POST_DOC_ID env var.
     """
     match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
     if not match:
@@ -423,29 +410,20 @@ def fetch_instagram_post_graphql(url: str, url_key: str) -> "list[Path]":
     if not payload:
         return []
 
-    # Navigate the response to find media items
     data = payload.get("data", {})
     media = (
         data.get("xdt_api__v1__media__shortcode__web_info", {})
         or data.get("shortcode_media")
         or data
     )
-    # Carousel
     items = media.get("edge_sidecar_to_children", {}).get("edges", [])
-    if items:
-        nodes = [e["node"] for e in items if "node" in e]
-    else:
-        nodes = [media]
+    nodes = [e["node"] for e in items if "node" in e] if items else [media]
 
     downloaded: list[Path] = []
     for idx, node in enumerate(nodes):
         is_video = node.get("is_video", False)
-        if is_video:
-            media_url = node.get("video_url")
-            ext = ".mp4"
-        else:
-            media_url = node.get("display_url")
-            ext = ".jpg"
+        media_url = node.get("video_url") if is_video else node.get("display_url")
+        ext = ".mp4" if is_video else ".jpg"
         if not media_url:
             continue
         dest = DOWNLOAD_DIR / f"{url_key}_{idx:03d}{ext}"
@@ -454,23 +432,24 @@ def fetch_instagram_post_graphql(url: str, url_key: str) -> "list[Path]":
             downloaded.append(dest)
         except Exception:
             continue
-
     return downloaded
 
 
 def fetch_instagram_stories(url: str, url_key: str) -> list[Path]:
     """
-    Private-story aware fetcher.
+    Private-story aware fetcher using query_hash reels_media endpoint.
 
     Strategy:
-      1. Resolve username -> user_id via Instagram profile API (needs cookies).
-      2. Determine story doc_id: scrape page first, fall back to INSTAGRAM_STORY_DOC_ID env var.
-      3. Execute the GraphQL reels_media query with authenticated headers.
-      4. Parse video_versions / image_versions2 items and download directly.
+      1. Resolve username -> numeric user_id (needed by the reels_media endpoint).
+      2. Build the query_hash URL via _build_story_query_url(user_id).
+      3. Execute with authenticated headers.
+      4. Parse items and download directly.
 
-    Returns [] on any failure so the caller shows manual instructions.
+    Returns [] on failure so caller shows manual instructions.
     """
     cookies = get_cookies_path()
+    if not cookies:
+        return []
 
     username, target_story_pk = extract_instagram_story_target(url)
     if not username:
@@ -480,24 +459,22 @@ def fetch_instagram_stories(url: str, url_key: str) -> list[Path]:
     if not user_id:
         return []
 
-    story_doc_id = _scrape_story_doc_id(username) or INSTAGRAM_STORY_DOC_ID
-    if not story_doc_id:
-        return []
-
     variables = {
         "reel_ids": [user_id],
+        "highlight_reel_ids": [],
         "precomposed_overlay": False,
-        "story_viewer_fetch_count": 50,
     }
-    payload = _execute_graphql(story_doc_id, variables, cookies)
+    payload = _execute_graphql(
+        INSTAGRAM_STORY_QUERY_HASH, variables, cookies, use_query_hash=True
+    )
     if not payload:
         return []
 
     reels_media = (
-        payload.get("data", {})
-               .get("xdt_api__v1__feed__reels_media__connection", {})
-               .get("reels_media")
-        or payload.get("data", {}).get("reels_media")
+        payload.get("data", {}).get("reels_media")
+        or payload.get("data", {})
+                   .get("xdt_api__v1__feed__reels_media__connection", {})
+                   .get("reels_media")
         or []
     )
     if not reels_media:
@@ -533,7 +510,6 @@ def fetch_instagram_stories(url: str, url_key: str) -> list[Path]:
             downloaded.append(dest)
         except Exception:
             continue
-
     return downloaded
 
 
@@ -542,10 +518,9 @@ def get_instagram_graphql_instructions(url: str) -> tuple["str | None", bool]:
     Build a GraphQL URL for manual browser paste (fallback when auto-fetch fails).
 
     For STORIES:
-      - Tries to resolve user_id, but falls back to username string if it fails.
-      - doc_id: scrape story page first, then INSTAGRAM_STORY_DOC_ID env var.
-      - Last resort: returns the plain stories page URL so the user always gets
-        something clickable.
+      - Resolves user_id; falls back to username string if lookup fails so a
+        link is always produced.
+      - Uses query_hash format (stable, same as Instagram's own web app).
 
     For POSTS:
       - doc_id: scrape post page first, then INSTAGRAM_POST_DOC_ID env var.
@@ -554,23 +529,10 @@ def get_instagram_graphql_instructions(url: str) -> tuple["str | None", bool]:
         username, _ = extract_instagram_story_target(url)
         if not username:
             return None, True
-
         # Try numeric user_id but DO NOT bail — fall back to username string
         cookies = get_cookies_path()
         user_id = _resolve_instagram_user_id(username, cookies) or username
-
-        story_doc_id = _scrape_story_doc_id(username) or INSTAGRAM_STORY_DOC_ID
-        if not story_doc_id:
-            # Absolute last resort: plain stories URL the user can open
-            return f"https://www.instagram.com/stories/{urllib.parse.quote(username)}/", True
-
-        variables = {
-            "reel_ids": [user_id],
-            "precomposed_overlay": False,
-            "story_viewer_fetch_count": 50,
-        }
-        encoded = urllib.parse.quote(json.dumps(variables, separators=(",", ":")))
-        return f"https://www.instagram.com/graphql/query/?doc_id={story_doc_id}&variables={encoded}", True
+        return _build_story_query_url(user_id), True
 
     match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
     if not match:
@@ -927,25 +889,25 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     parse_mode="Markdown"
                 )
                 return
-            # Auto-download failed — try to generate a story GraphQL link, else manual DevTools
+            # Auto-download failed — generate a clickable GraphQL link; DevTools as last resort
             api_url, _ = get_instagram_graphql_instructions(url)
             if api_url:
                 instructions = (
                     "👻 **Instagram Story Detected**\n\n"
                     "Automatic download failed.\n\n"
-                    f"1. Open this link while logged in: [Story GraphQL Payload]({api_url})\n"
-                    "2. Copy the full JSON response.\n"
-                    "3. **Paste or upload that JSON here.**"
+                    "Open this link **while logged into Instagram** in your browser:\n"
+                    f"[📡 Story GraphQL Payload]({api_url})\n\n"
+                    "Then copy the full JSON response (**Ctrl+A** → **Ctrl+C**) and paste it here."
                 )
             else:
                 instructions = (
                     "👻 **Instagram Story Detected**\n\n"
                     "Automatic download failed (stories require a logged-in session).\n\n"
                     "**Manual steps:**\n"
-                    "1. Open the Story in your browser and press **F12** → Network tab.\n"
-                    "2. Filter requests by `reels_media` or `graphql`.\n"
-                    "3. Refresh (**Ctrl+R**), then copy the full **Response** of the matching request.\n"
-                    "4. **Paste or upload that JSON text** directly into this chat."
+                    "1. Open the Story in your browser → **F12** → Network tab.\n"
+                    "2. Filter by `reels_media` or `graphql`.\n"
+                    "3. Refresh (**Ctrl+R**), copy the full **Response** JSON.\n"
+                    "4. **Paste or upload it here.**"
                 )
             await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
             return
