@@ -444,14 +444,26 @@ async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 # ... [Keep your imports, config, and helper functions identical] ...
 
 def get_instagram_api_url(url: str) -> str | None:
-    """Extracts the shortcode from an Instagram URL and returns the clean API endpoint."""
-    # Matches /p/abcde/, /reel/abcde/, /tv/abcde/, or share links
+    """Extracts the shortcode from an Instagram URL and returns the structural GraphQL query endpoint."""
+    # Matches /p/abcde/, /reel/abcde/, /tv/abcde/, or share formats
     match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
     if not match:
         return None
     shortcode = match.group(1)
-    # This endpoint returns the clean JSON data layout for the post
-    return f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
+    
+    # Precise GraphQL parameters structure
+    variables = {
+        "shortcode": shortcode,
+        "fetch_tagged_user_count": None,
+        "hoisted_comment_id": None,
+        "hoisted_reply_id": None
+    }
+    
+    # URL encode the variables block safely
+    encoded_vars = urllib.parse.quote(json.dumps(variables))
+    
+    # Build complete explicit outcome URL matching doc_id index signature
+    return f"https://www.instagram.com/graphql/query/?doc_id=8845758582119845&variables={encoded_vars}"
 
 # ── Telegram Handlers ──────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
