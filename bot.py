@@ -28,8 +28,9 @@ PORT         = int(os.environ.get("PORT", "10000"))
 DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "ytdlp_bot"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-_RENDER_COOKIES  = Path("/etc/secrets/youtube_cookies.txt")
-_RUNTIME_COOKIES = DOWNLOAD_DIR / "youtube_cookies.txt"
+_RENDER_COOKIES     = Path("/etc/secrets/youtube_cookies.txt")
+_INSTAGRAM_COOKIES  = Path("/etc/secrets/instagram_cookies.txt")
+_RUNTIME_COOKIES    = DOWNLOAD_DIR / "youtube_cookies.txt"
 
 MAX_FILESIZE_MB    = 500
 TELEGRAM_MAX_BYTES = MAX_FILESIZE_MB * 1024 * 1024
@@ -98,9 +99,13 @@ def extract_url(text: str) -> str | None:
 
 def base_args(url: str) -> list[str]:
     args = ["--no-warnings"]
-    cookies = get_cookies_path()
-    if cookies:
-        args += ["--cookies", str(cookies)]
+    # Separate cookie streams for stability
+    if "instagram.com" in url.lower() and _INSTAGRAM_COOKIES.exists():
+        args += ["--cookies", str(_INSTAGRAM_COOKIES)]
+    else:
+        cookies = get_cookies_path()
+        if cookies:
+            args += ["--cookies", str(cookies)]
     return args
 
 def run_ytdlp(args: list[str]) -> tuple[str, str, int]:
@@ -491,10 +496,10 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             api_url = get_instagram_api_url(url)
             instructions = (
                 f"🔒 **Instagram Protected Content**\n"
-                f"Direct access blocked. Route session through your browser:\n\n"
-                f"1. Open link:\n`{api_url}`\n\n"
-                f"2. Select all and copy (**Ctrl+A** then **Ctrl+C**).\n"
-                f"3. **Paste/Upload text data output** straight back to this chat."
+                f"Direct access blocked by Instagram security checks.\n\n"
+                f"1. Open this link in your browser:\n`{api_url}`\n\n"
+                f"2. Select all text and copy (**Ctrl+A** then **Ctrl+C**).\n"
+                f"3. **Paste/Upload text data layout** back into this chat window."
             )
             await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
         else:
