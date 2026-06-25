@@ -309,8 +309,44 @@ def _build_ig_headers(cookies_path: "Path | None" = None) -> dict:
     return headers
 
 
+def _scrape_instagram_user_id(username: str) -> "str | None":
+    """
+    Fallback: fetch the public profile page and grep for a numeric user ID.
+    Works even without cookies for public accounts.
+    """
+    try:
+        req = urllib.request.Request(
+            f"https://www.instagram.com/{urllib.parse.quote(username)}/",
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        for pattern in [
+            r'"profilePage_(\d+)"',
+            r'"user_id"\s*:\s*"?(\d+)"?',
+            r'"owner"\s*:\s*\{[^}]*"id"\s*:\s*"?(\d{5,})"?',
+        ]:
+            m = re.search(pattern, html)
+            if m and m.group(1).isdigit():
+                return m.group(1)
+        return None
+    except Exception:
+        return None
+
+
 def _resolve_instagram_user_id(username: str, cookies_path: "Path | None" = None) -> "str | None":
-    """Resolve a numeric user_id for the given username via the web profile API."""
+    """
+    Resolve a numeric user_id for the given username.
+    1. web_profile_info API (needs cookies)
+    2. Public profile page HTML scrape (fallback, no cookies needed)
+    """
     headers = _build_ig_headers(cookies_path)
     req = urllib.request.Request(
         f"https://www.instagram.com/api/v1/users/web_profile_info/?username={urllib.parse.quote(username)}",
@@ -320,9 +356,12 @@ def _resolve_instagram_user_id(username: str, cookies_path: "Path | None" = None
         with urllib.request.urlopen(req, timeout=20) as resp:
             payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
         uid = payload.get("data", {}).get("user", {}).get("id")
-        return str(uid) if uid else None
+        if uid and str(uid).isdigit():
+            return str(uid)
     except Exception:
-        return None
+        pass
+    # Fallback: scrape public profile HTML
+    return _scrape_instagram_user_id(username)
 
 
 def _scrape_post_doc_id(shortcode: str) -> "str | None":
@@ -347,29 +386,32 @@ def _scrape_post_doc_id(shortcode: str) -> "str | None":
         return None
 
 
-def _build_story_query_url(user_id: str) -> str:
+def _build_story_query_url(user_id: str) -> "str | None":
     """
-    Build the Instagram stories GraphQL URL.
-
-    Uses query_hash (the format Instagram's own web app uses for reels_media).
-    INSTAGRAM_STORY_QUERY_HASH env var — defaults to the known working value
-    de8017ee0a7c9c45ec4260733d81ea31 which is stable across months unlike doc_id.
+    Build the exact stories GraphQL URL.
+    reel_ids MUST be a numeric integer — username strings cause execution errors.
+    Returns None if user_id is not numeric.
     """
+    if not user_id or not str(user_id).isdigit():
+        return None
     variables = {
-        "reel_ids": [user_id],
+        "reel_ids": [int(user_id)],
         "highlight_reel_ids": [],
         "precomposed_overlay": False,
     }
     encoded = urllib.parse.quote(json.dumps(variables, separators=(",", ":")))
     return (
-        f"https://www.instagram.com/graphql/query/"
+        "https://www.instagram.com/graphql/query/"
         f"?query_hash={INSTAGRAM_STORY_QUERY_HASH}&variables={encoded}"
     )
 
 
-def _execute_graphql(doc_id_or_hash: str, variables: dict,
-                     cookies_path: "Path | None" = None,
-                     use_query_hash: bool = False) -> "dict | None":
+def _execute_graphql(
+    doc_id_or_hash: str,
+    variables: dict,
+    cookies_path: "Path | None" = None,
+    use_query_hash: bool = False,
+) -> "dict | None":
     """
     Fire a GraphQL query against the Instagram endpoint and return parsed JSON.
     Supports both doc_id and query_hash formats.
@@ -437,35 +479,35 @@ def fetch_instagram_post_graphql(url: str, url_key: str) -> "list[Path]":
 
 def fetch_instagram_stories(url: str, url_key: str) -> list[Path]:
     """
-    Private-story aware fetcher using query_hash reels_media endpoint.
+    Private-story aware fetcher using the reels_media query_hash endpoint.
+    reel_ids MUST be a numeric integer ID — not a username string.
 
     Strategy:
-      1. Resolve username -> numeric user_id (needed by the reels_media endpoint).
-      2. Build the query_hash URL via _build_story_query_url(user_id).
+      1. Resolve username -> numeric user_id (API first, HTML scrape fallback).
+      2. Build query_hash URL with int(user_id) in reel_ids.
       3. Execute with authenticated headers.
-      4. Parse items and download directly.
-
-    Returns [] on failure so caller shows manual instructions.
+      4. Parse and download items.
     """
     cookies = get_cookies_path()
-    if not cookies:
-        return []
 
     username, target_story_pk = extract_instagram_story_target(url)
     if not username:
         return []
 
     user_id = _resolve_instagram_user_id(username, cookies)
-    if not user_id:
+    if not user_id or not str(user_id).isdigit():
         return []
 
     variables = {
-        "reel_ids": [user_id],
+        "reel_ids": [int(user_id)],
         "highlight_reel_ids": [],
         "precomposed_overlay": False,
     }
     payload = _execute_graphql(
-        INSTAGRAM_STORY_QUERY_HASH, variables, cookies, use_query_hash=True
+        INSTAGRAM_STORY_QUERY_HASH,
+        variables,
+        cookies,
+        use_query_hash=True,
     )
     if not payload:
         return []
@@ -518,9 +560,8 @@ def get_instagram_graphql_instructions(url: str) -> tuple["str | None", bool]:
     Build a GraphQL URL for manual browser paste (fallback when auto-fetch fails).
 
     For STORIES:
-      - Resolves user_id; falls back to username string if lookup fails so a
-        link is always produced.
-      - Uses query_hash format (stable, same as Instagram's own web app).
+      - Resolves numeric user_id (API + HTML scrape fallback).
+      - Only generates a link when user_id is numeric — no bogus username strings.
 
     For POSTS:
       - doc_id: scrape post page first, then INSTAGRAM_POST_DOC_ID env var.
@@ -529,9 +570,8 @@ def get_instagram_graphql_instructions(url: str) -> tuple["str | None", bool]:
         username, _ = extract_instagram_story_target(url)
         if not username:
             return None, True
-        # Try numeric user_id but DO NOT bail — fall back to username string
         cookies = get_cookies_path()
-        user_id = _resolve_instagram_user_id(username, cookies) or username
+        user_id = _resolve_instagram_user_id(username, cookies)
         return _build_story_query_url(user_id), True
 
     match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
