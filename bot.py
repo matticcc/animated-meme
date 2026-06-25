@@ -371,7 +371,7 @@ def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "
 def probe_url(url: str) -> dict:
     if is_tiktok_photo_url(url):
         return {"_use_gallerydl": True, "url": url}
-    stdout, stderr, code = run_ytdlp(base_args(url) + ["-J", url])
+    stdout, stderr, code = run_ytdlp(base_args(url) + ["-J", "--no-playlist", url])
     if code != 0:
         err = clean_errors(stderr)
         if "Unsupported URL" in err and is_image_capable(url):
@@ -592,6 +592,8 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
         return
         
+    msg = await update.message.reply_text(f"🔍 Scraping **{site}** content...", parse_mode="Markdown")
+        
     if is_tiktok_photo_url(url):
         files = await asyncio.get_event_loop().run_in_executor(None, download_images, url, url_key)
         if not files:
@@ -638,7 +640,7 @@ async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     elif choice == "audio":
         fmt_arg, is_audio = "bestaudio/best", True
     elif choice == "best":
-        fmt_arg = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        fmt_arg = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best"
         is_audio = False
     else:
         idx = int(choice)
