@@ -142,12 +142,12 @@ def base_args(url: str) -> list[str]:
         "--no-cache-dir"
     ]
     
-    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        # FORCES REMOTELY SOLVED JS SIGNATURE CHALLENGES & BYPASSES MISSING RENDER RUNTIMES
-        args += [
-            "--remote-components", "ejs:github",
-            "--extractor-args", "youtube:player_client=default,ios;formats=missing_pot"
-        ]
+    # Check if this is a YouTube link
+    is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+
+    if is_youtube:
+        # Force a mobile scraper client that doesn't trigger the JS challenge wall
+        args += ["--extractor-args", "youtube:player_client=android"]
         
     elif "tiktok.com" in url.lower():
         args += ["--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"]
@@ -156,9 +156,12 @@ def base_args(url: str) -> list[str]:
         args += ["--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"]
         args += ["--socket-timeout", "15"]
 
-    cookies = get_cookies_path()
-    if cookies:
-        args += ["--cookies", str(cookies)]
+    # ONLY attach cookies if it's NOT YouTube to completely avoid the Deno/JS runtime block!
+    if not is_youtube:
+        cookies = get_cookies_path()
+        if cookies:
+            args += ["--cookies", str(cookies)]
+            
     return args
 
 def run_ytdlp(args: list[str]) -> tuple[str, str, int]:
