@@ -36,8 +36,6 @@ MAX_FILESIZE_MB = 500
 TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50MB strict limit
 
 KNOWN_SITES: dict[str, str] = {
-    "youtube.com": "YouTube",
-    "youtu.be":    "YouTube",
     "tiktok.com":  "TikTok",
     "reddit.com":  "Reddit",
     "redgifs.com": "RedGifs",
@@ -139,7 +137,7 @@ def base_args(url: str) -> list[str]:
         # Fallback chain: tv_embedded → android → web (web_creator as last resort).
         args += [
             "--extractor-args",
-            "youtube:player_client=android,web,tv_embedded",
+            "youtube:player_client=tv_embedded,android,web_creator",
         ]
         # Cookie handling: prefer writable copy so yt-dlp can update the jar
         yt_cookies_path = DOWNLOAD_DIR / "youtube_cookies.txt"
@@ -198,9 +196,9 @@ def is_tiktok_photo_url(url: str) -> bool:
 
 def fetch_instagram_public(url: str, url_key: str) -> list[Path] | None:
     """
-    Attempt to fetch a public Instagram post directly via the internal GraphQL API.
-    Scrapes the current doc_id from the embed page to avoid hardcoded-ID rot.
-    Returns list of downloaded Paths on success, None on failure (private/rate-limited).
+    Fetch a public Instagram post via the i.instagram.com media info API.
+    Uses the iPhone user-agent path which returns full media JSON without auth
+    for public posts. Returns list of Paths on success, None on failure.
     """
     import urllib.request as _req
 
@@ -209,53 +207,28 @@ def fetch_instagram_public(url: str, url_key: str) -> list[Path] | None:
         return None
     shortcode = match.group(1)
 
-    # Step 1: scrape a fresh doc_id from Instagram's embed page
-    doc_id = None
-    try:
-        embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
-        req = _req.Request(embed_url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-        with _req.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        # doc_id appears as a numeric string in the embed JS bundle
-        m = re.search(r'"doc_id"\s*:\s*"?(\d{10,})"?', html)
-        if m:
-            doc_id = m.group(1)
-    except Exception:
-        pass
-
-    # Step 2: query the GraphQL endpoint
-    if not doc_id:
-        return None
+    # The i.instagram.com/api/v1/media/shortcode/web_info/ endpoint returns
+    # full media JSON for public posts without requiring a login session.
+    api_url = f"https://i.instagram.com/api/v1/media/shortcode/web_info/?shortcode={shortcode}&include_reel=false"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                      "Mobile/15E148 Safari/604.1",
+        "X-Ig-App-Id": "936619743392459",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.instagram.com/",
+    }
 
     try:
-        gql_url = "https://www.instagram.com/graphql/query"
-        payload = urllib.parse.urlencode({
-            "variables": json.dumps({"shortcode": shortcode}),
-            "doc_id": doc_id,
-        }).encode()
-        req = _req.Request(gql_url, data=payload, method="POST", headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/124.0.0.0 Safari/537.36",
-            "X-Ig-App-Id": "936619743392459",
-            "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Origin": "https://www.instagram.com",
-            "Referer": f"https://www.instagram.com/p/{shortcode}/",
-        })
+        req = _req.Request(api_url, headers=headers)
         with _req.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
     except Exception:
         return None
 
-    # Step 3: parse the JSON exactly like parse_and_download_instagram does
+    # Response shape: {"items": [{...media...}]}
+    # Wrap it so parse_and_download_instagram can handle it
     try:
         raw_json = json.dumps(data)
         return parse_and_download_instagram(raw_json, url_key, "all", is_raw_json=True)
