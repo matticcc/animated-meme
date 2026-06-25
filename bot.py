@@ -376,14 +376,14 @@ async def send_photos(message, files: list[Path]) -> None:
         return
     if len(files) == 1:
         with open(files[0], "rb") as f:
-            await message.reply_photo(photo=f, read_timeout=120, write_timeout=120, connect_timeout=30)
+            await message.reply_photo(photo=f, read_timeout=300, write_timeout=300, connect_timeout=60)
         return
     for batch_start in range(0, len(files), 10):
         batch = files[batch_start:batch_start + 10]
         opened = [open(fp, "rb") for fp in batch]
         try:
             media = [InputMediaPhoto(media=fh) for fh in opened]
-            await message.reply_media_group(media=media, read_timeout=120, write_timeout=120, connect_timeout=30)
+            await message.reply_media_group(media=media, read_timeout=300, write_timeout=300, connect_timeout=60)
         finally:
             for fh in opened:
                 fh.close()
@@ -683,6 +683,7 @@ async def handle_instagram_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     target_payload = data["raw_json"] if is_raw else data["url"]
     await query.edit_message_text("⬇ Compiling assets... please wait.")
     
+    files = []
     try:
         files = await asyncio.get_event_loop().run_in_executor(
             None, parse_and_download_instagram, target_payload, url_key, choice, is_raw
@@ -704,7 +705,13 @@ async def handle_instagram_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             await send_photos(query.message, images)
         for vid in videos:
             with open(vid, "rb") as f:
-                await query.message.reply_video(video=f, supports_streaming=True)
+                await query.message.reply_video(
+                    video=f, 
+                    supports_streaming=True, 
+                    read_timeout=300, 
+                    write_timeout=300, 
+                    connect_timeout=60
+                )
         await query.delete_message()
     except Exception as e:
         await query.edit_message_text(f"❌ Upload error: `{e}`", parse_mode="Markdown")
@@ -726,6 +733,7 @@ async def handle_instagram_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     target_payload = data["raw_json"] if is_raw else data["url"]
     await query.edit_message_text(f"📥 Extracting item index [{int(target_idx)+1}]...")
     
+    files = []
     try:
         files = await asyncio.get_event_loop().run_in_executor(
             None, parse_and_download_instagram, target_payload, url_key, "all", is_raw, target_idx
@@ -739,7 +747,13 @@ async def handle_instagram_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
             await send_photos(query.message, files)
         else:
             with open(files[0], "rb") as f:
-                await query.message.reply_video(video=f, supports_streaming=True)
+                await query.message.reply_video(
+                    video=f, 
+                    supports_streaming=True, 
+                    read_timeout=300, 
+                    write_timeout=300, 
+                    connect_timeout=60
+                )
         await query.delete_message()
     except Exception as e:
         await query.edit_message_text(f"❌ Extraction error: `{e}`")
