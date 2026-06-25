@@ -1,13 +1,26 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies, Node.js (for YouTube decryption), and ffmpeg (for merging formats)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg ca-certificates \
+    curl \
+    ca-certificates \
+    ffmpeg \
+    && curl -sL https://deb.nodesource.com/setup_18.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# Copy requirements first to leverage Docker caching layers
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py .
+# Copy the rest of your application files
+COPY . .
 
+# Run the bot entrypoint
 CMD ["python", "bot.py"]
