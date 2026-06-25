@@ -37,7 +37,6 @@ TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50MB strict limit
 
 KNOWN_SITES: dict[str, str] = {
     "tiktok.com":  "TikTok",
-    "reddit.com":  "Reddit",
     "redgifs.com": "RedGifs",
     "instagram.com": "Instagram",
 }
@@ -47,12 +46,12 @@ IMAGE_CAPABLE_SITES = {"tiktok.com", "instagram.com"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 QUALITY_PRESETS = [
-    ("4K",    "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/best"),
-    ("2K",    "bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/best"),
-    ("1080p", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best"),
-    ("720p",  "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best"),
-    ("480p",  "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best"),
-    ("360p",  "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best"),
+    ("4K",    2160, "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best"),
+    ("2K",    1440, "bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1440]+bestaudio/best"),
+    ("1080p", 1080, "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best"),
+    ("720p",   720, "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best"),
+    ("480p",   480, "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best"),
+    ("360p",   360, "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best"),
 ]
 
 # ── Cookie helpers ─────────────────────────────────────────────────────────────
@@ -239,15 +238,36 @@ def fetch_instagram_public(url: str, url_key: str) -> list[Path] | None:
 def get_instagram_graphql_instructions(url: str) -> tuple[str | None, bool]:
     """
     Returns (graphql_api_url_for_manual_paste, is_story).
-    Used as the fallback for private posts when direct fetch fails.
-    Builds the URL fresh each call so doc_id is not hardcoded here.
+    Tries to scrape a fresh doc_id from the post page so the link actually works.
+    Falls back to the last known working doc_id if scraping fails.
     """
+    import urllib.request as _req
+
     if "/stories/" in url.lower():
         return None, True
     match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
     if not match:
         return None, False
     shortcode = match.group(1)
+
+    # Try to scrape a live doc_id from the post page
+    doc_id = "8845758582119845"  # fallback
+    try:
+        page_url = f"https://www.instagram.com/p/{shortcode}/"
+        req = _req.Request(page_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        with _req.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        m = re.search(r'"doc_id"\s*:\s*"?(\d{10,})"?', html)
+        if m:
+            doc_id = m.group(1)
+    except Exception:
+        pass
+
     variables = {
         "shortcode": shortcode,
         "fetch_tagged_user_count": None,
@@ -255,7 +275,7 @@ def get_instagram_graphql_instructions(url: str) -> tuple[str | None, bool]:
         "hoisted_reply_id": None,
     }
     encoded_vars = urllib.parse.quote(json.dumps(variables))
-    return f"https://www.instagram.com/graphql/query/?doc_id=8845758582119845&variables={encoded_vars}", False
+    return f"https://www.instagram.com/graphql/query/?doc_id={doc_id}&variables={encoded_vars}", False
 
 def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "all", is_raw_json: bool = False, dynamic_target_idx: str = None) -> list[Path]:
     downloaded_paths = []
@@ -407,8 +427,8 @@ def download_images(url: str, url_key: str) -> list[Path]:
 
 def build_video_keyboard(url_key: str, heights: list[int]) -> InlineKeyboardMarkup:
     buttons = [[InlineKeyboardButton("⭐ Best Quality", callback_data=f"dl|{url_key}|best")]]
-    for i, (label, h_val) in enumerate(QUALITY_PRESETS):
-        if any(h <= int(h_val) for h in heights):
+    for i, (label, h_int, _fmt) in enumerate(QUALITY_PRESETS):
+        if any(h <= h_int for h in heights):
             buttons.append([InlineKeyboardButton(label, callback_data=f"dl|{url_key}|{i}")])
     buttons.append([InlineKeyboardButton("🎵 Audio only", callback_data=f"dl|{url_key}|audio")])
     return InlineKeyboardMarkup(buttons)
@@ -593,7 +613,7 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     heights = get_available_heights(info)
-    ctx.user_data[url_key] = {"url": url, "type": "video", "presets": [h[1] for h in QUALITY_PRESETS if any(hv <= int(h[1]) for hv in heights)]}
+    ctx.user_data[url_key] = {"url": url, "type": "video", "presets": [fmt for (_label, h_int, fmt) in QUALITY_PRESETS if any(hv <= h_int for hv in heights)]}
     await msg.edit_text(f"📺 *{site}* stream targeted. Select output layout profiles:", reply_markup=build_video_keyboard(url_key, heights), parse_mode="Markdown")
 
 async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
