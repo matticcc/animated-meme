@@ -145,13 +145,12 @@ def base_args(url: str) -> list[str]:
     is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
 
     if is_youtube:
-        # tv_downgraded bypasses player challenges by requesting legacy static streams
+        # Crucial: Specify Node runtime but DO NOT lock down formatting logic here!
         args += [
-            "--extractor-args", 
-            "youtube:player_client=tv_downgraded,web_embedded;formats=missing_pot"
+            "--js-runtimes", "node",
+            "--extractor-args", "youtube:player_client=android,web;formats=missing_pot"
         ]
         
-        # Pull your dedicated youtube_cookies mapping file cleanly
         yt_cookies_path = DOWNLOAD_DIR / "youtube_cookies.txt"
         if not yt_cookies_path.exists() and _RENDER_COOKIES.exists():
             try:
@@ -169,7 +168,6 @@ def base_args(url: str) -> list[str]:
         args += ["--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"]
         args += ["--socket-timeout", "15"]
 
-    # Other sites (Instagram, Reddit, etc.) fall back normally without touching the YouTube session map
     if not is_youtube:
         cookies = get_cookies_path()
         if cookies:
