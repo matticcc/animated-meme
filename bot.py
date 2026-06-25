@@ -904,10 +904,53 @@ async def handle_photo_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         for fp in all_files: fp.unlink(missing_ok=True)
     ctx.user_data.pop(url_key, None)
 
+async def debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    import shutil
+    lines = []
+    # Cookie file status
+    render_path = Path("/etc/secrets/youtube_cookies.txt")
+    runtime_path = DOWNLOAD_DIR / "youtube_cookies.txt"
+    lines.append(f"Render secret exists: {render_path.exists()}")
+    if render_path.exists():
+        lines.append(f"Render secret size: {render_path.stat().st_size} bytes")
+        first = render_path.read_text(encoding="utf-8", errors="replace")[:80]
+        lines.append(f"First 80 chars: {repr(first)}")
+    lines.append(f"Runtime cookie exists: {runtime_path.exists()}")
+    active = DOWNLOAD_DIR / "active_cookies.txt"
+    lines.append(f"Active cookie exists: {active.exists()}")
+    # yt-dlp test on instagram
+    stdout, stderr, code = run_ytdlp([
+        "--no-warnings", "--no-check-certificates",
+        "--user-agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "--add-header", "X-Ig-App-Id:936619743392459",
+        "--socket-timeout", "15",
+        "--no-playlist",
+        "-J", "https://www.instagram.com/p/DZvyyGYDKD5/",
+    ])
+    lines.append(f"yt-dlp exit code (no cookies): {code}")
+    lines.append(f"stderr: {stderr.strip()[:200]}")
+    cookies = get_cookies_path()
+    if cookies:
+        stdout2, stderr2, code2 = run_ytdlp([
+            "--no-warnings", "--no-check-certificates",
+            "--user-agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "--add-header", "X-Ig-App-Id:936619743392459",
+            "--cookies", str(cookies),
+            "--socket-timeout", "15",
+            "--no-playlist",
+            "-J", "https://www.instagram.com/p/DZvyyGYDKD5/",
+        ])
+        lines.append(f"yt-dlp exit code (WITH cookies): {code2}")
+        lines.append(f"stderr: {stderr2.strip()[:200]}")
+    else:
+        lines.append("No cookies file found — skipping cookie test")
+    await update.message.reply_text("\n".join(lines))
+
 def main() -> None:
     threading.Thread(target=run_health_server, daemon=True).start()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("debug", debug))
     app.add_handler(MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, handle_input))
     app.add_handler(CallbackQueryHandler(handle_download, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(handle_photo_pick, pattern=r"^pick\|"))
