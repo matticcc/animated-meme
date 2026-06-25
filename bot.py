@@ -35,14 +35,6 @@ _RUNTIME_COOKIES = DOWNLOAD_DIR / "youtube_cookies.txt"
 MAX_FILESIZE_MB = 500
 TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50MB strict limit
 
-INSTAGRAM_POST_DOC_ID  = os.environ.get("INSTAGRAM_POST_DOC_ID", "").strip()
-INSTAGRAM_STORY_DOC_ID = os.environ.get("INSTAGRAM_STORY_DOC_ID", "").strip()
-INSTAGRAM_APP_ID       = os.environ.get("INSTAGRAM_APP_ID", "936619743392459").strip()
-
-INSTAGRAM_POST_DOC_ID   = os.environ.get("INSTAGRAM_POST_DOC_ID", "").strip()
-INSTAGRAM_STORY_QUERY_HASH = os.environ.get("INSTAGRAM_STORY_QUERY_HASH", "de8017ee0a7c9c45ec4260733d81ea31").strip()
-INSTAGRAM_APP_ID         = os.environ.get("INSTAGRAM_APP_ID", "936619743392459").strip()
-
 KNOWN_SITES: dict[str, str] = {
     "tiktok.com":  "TikTok",
     "redgifs.com": "RedGifs",
@@ -203,61 +195,44 @@ def is_tiktok_photo_url(url: str) -> bool:
 
 def fetch_instagram_public(url: str, url_key: str) -> list[Path] | None:
     """
-    Download a public Instagram post (photo/reel/carousel).
-    - Images/carousels: gallery-dl with cookies
-    - Reels/videos: yt-dlp with cookies
+    Fetch a public Instagram post via the i.instagram.com media info API.
+    Uses the iPhone user-agent path which returns full media JSON without auth
+    for public posts. Returns list of Paths on success, None on failure.
     """
-    cookies = get_cookies_path()
+    import urllib.request as _req
 
-    def collected() -> list[Path]:
-        return [p for p in DOWNLOAD_DIR.glob(f"{url_key}_*")
-                if not p.name.endswith((".part", ".ytdl"))]
+    match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
+    if not match:
+        return None
+    shortcode = match.group(1)
 
-    # ── Attempt 1: gallery-dl (handles image posts and carousels) ─────────
-    sub = DOWNLOAD_DIR / url_key
-    sub.mkdir(exist_ok=True)
-    gdl_args = ["gallery-dl", "--dest", str(sub)]
-    if cookies:
-        gdl_args += ["-C", str(cookies)]
-    gdl_args.append(url)
-    subprocess.run(gdl_args, capture_output=True, text=True, timeout=120)
-    gdl_files = sorted([p for p in sub.rglob("*")
-                        if p.is_file() and p.suffix.lower() in IMAGE_EXTS])
-    if gdl_files:
-        moved = []
-        for i, fp in enumerate(gdl_files):
-            dest = DOWNLOAD_DIR / f"{url_key}_{i:03d}{fp.suffix}"
-            fp.rename(dest)
-            moved.append(dest)
-        try: sub.rmdir()
-        except Exception: pass
-        return moved
+    # The i.instagram.com/api/v1/media/shortcode/web_info/ endpoint returns
+    # full media JSON for public posts without requiring a login session.
+    api_url = f"https://i.instagram.com/api/v1/media/shortcode/web_info/?shortcode={shortcode}&include_reel=false"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                      "Mobile/15E148 Safari/604.1",
+        "X-Ig-App-Id": "936619743392459",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.instagram.com/",
+    }
 
-    # ── Attempt 2: yt-dlp with cookies (reels / video posts) ─────────────
-    if cookies:
-        ig_args = [
-            "--no-warnings", "--rm-cache-dir", "--no-cache-dir",
-            "--user-agent",
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-            "Mobile/15E148 Safari/604.1",
-            "--add-header", f"X-Ig-App-Id:{INSTAGRAM_APP_ID}",
-            "--cookies", str(cookies),
-            "--socket-timeout", "20",
-            "--no-playlist",
-        ]
-        out_vid = str(DOWNLOAD_DIR / f"{url_key}_%(title).60s.%(ext)s")
-        fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
-        run_ytdlp(ig_args + [
-            "-f", fmt, "--merge-output-format", "mp4",
-            "--format-sort", "ext:mp4:m4a",
-            "-o", out_vid, url,
-        ])
-        files = collected()
-        if files:
-            return files
+    try:
+        req = _req.Request(api_url, headers=headers)
+        with _req.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return None
 
-    return None
+    # Response shape: {"items": [{...media...}]}
+    # Wrap it so parse_and_download_instagram can handle it
+    try:
+        raw_json = json.dumps(data)
+        return parse_and_download_instagram(raw_json, url_key, "all", is_raw_json=True)
+    except Exception:
+        return None
 
 
 def is_instagram_story_url(url: str) -> bool:
@@ -265,353 +240,117 @@ def is_instagram_story_url(url: str) -> bool:
     low = url.lower()
     return "instagram.com" in low and (
         "/stories/" in low or
-        "/s/" in low or
-        "highlight:" in low
+        "/s/" in low or          # short share links for stories
+        "highlight:" in low      # highlight reel links
     )
-
-
-def extract_instagram_story_target(url: str) -> tuple[str | None, str | None]:
-    """Return (username, story_pk_or_none) from a stories URL."""
-    m = re.search(r"instagram\.com/stories/([^/?#]+)/?([^/?#]+)?", url)
-    if not m:
-        return None, None
-    username = m.group(1)
-    story_pk = m.group(2) if m.group(2) and m.group(2).isdigit() else None
-    return username, story_pk
-
-
-def _build_ig_headers(cookies_path: "Path | None" = None) -> dict:
-    """Build Instagram request headers, injecting cookies from a Netscape jar."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-            "Mobile/15E148 Safari/604.1"
-        ),
-        "X-Ig-App-Id": INSTAGRAM_APP_ID,
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.instagram.com/",
-    }
-    if cookies_path and cookies_path.exists():
-        try:
-            parts = []
-            for line in cookies_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-                if not line or line.startswith("#"):
-                    continue
-                cols = line.split("\t")
-                if len(cols) >= 7:
-                    parts.append(f"{cols[5]}={cols[6]}")
-            if parts:
-                headers["Cookie"] = "; ".join(parts)
-        except Exception:
-            pass
-    return headers
-
-
-def _scrape_instagram_user_id(username: str) -> "str | None":
-    """
-    Fallback: fetch the public profile page and grep for a numeric user ID.
-    Works even without cookies for public accounts.
-    """
-    try:
-        req = urllib.request.Request(
-            f"https://www.instagram.com/{urllib.parse.quote(username)}/",
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        for pattern in [
-            r'"profilePage_(\d+)"',
-            r'"user_id"\s*:\s*"?(\d+)"?',
-            r'"owner"\s*:\s*\{[^}]*"id"\s*:\s*"?(\d{5,})"?',
-        ]:
-            m = re.search(pattern, html)
-            if m and m.group(1).isdigit():
-                return m.group(1)
-        return None
-    except Exception:
-        return None
-
-
-def _resolve_instagram_user_id(username: str, cookies_path: "Path | None" = None) -> "str | None":
-    """
-    Resolve a numeric user_id for the given username.
-    1. web_profile_info API (needs cookies)
-    2. Public profile page HTML scrape (fallback, no cookies needed)
-    """
-    headers = _build_ig_headers(cookies_path)
-    req = urllib.request.Request(
-        f"https://www.instagram.com/api/v1/users/web_profile_info/?username={urllib.parse.quote(username)}",
-        headers=headers,
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
-        uid = payload.get("data", {}).get("user", {}).get("id")
-        if uid and str(uid).isdigit():
-            return str(uid)
-    except Exception:
-        pass
-    return _scrape_instagram_user_id(username)
-
-
-def _scrape_post_doc_id(shortcode: str) -> "str | None":
-    """Scrape the post page HTML for a live doc_id. Returns None on failure."""
-    try:
-        req = urllib.request.Request(
-            f"https://www.instagram.com/p/{shortcode}/",
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        m = re.search(r'"doc_id"\s*:\s*"?(\d{10,})"?', html)
-        return m.group(1) if m else None
-    except Exception:
-        return None
-
-
-def _build_story_query_url(user_id: str) -> "str | None":
-    """
-    Build the exact stories GraphQL URL.
-    reel_ids MUST be a numeric integer — username strings cause execution errors.
-    Returns None if user_id is not numeric.
-    """
-    if not user_id or not str(user_id).isdigit():
-        return None
-    variables = {
-        "reel_ids": [int(user_id)],
-        "highlight_reel_ids": [],
-        "precomposed_overlay": False,
-    }
-    encoded = urllib.parse.quote(json.dumps(variables, separators=(",", ":")))
-    return (
-        "https://www.instagram.com/graphql/query/"
-        f"?query_hash={INSTAGRAM_STORY_QUERY_HASH}&variables={encoded}"
-    )
-
-
-def _execute_graphql(
-    doc_id_or_hash: str,
-    variables: dict,
-    cookies_path: "Path | None" = None,
-    use_query_hash: bool = False,
-) -> "dict | None":
-    """
-    Fire a GraphQL query against the Instagram endpoint and return parsed JSON.
-    Supports both doc_id and query_hash formats.
-    """
-    encoded = urllib.parse.quote(json.dumps(variables, separators=(",", ":")))
-    param = "query_hash" if use_query_hash else "doc_id"
-    url = f"https://www.instagram.com/graphql/query/?{param}={doc_id_or_hash}&variables={encoded}"
-    req = urllib.request.Request(url, headers=_build_ig_headers(cookies_path))
-    try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            return json.loads(resp.read().decode("utf-8", errors="ignore"))
-    except Exception:
-        return None
-
-
-def _extract_story_media_url(item: dict) -> "tuple[str | None, str]":
-    """
-    Extract (media_url, ext) from a story item.
-
-    Story GraphQL responses use:
-      - video_resources[].src  (videos)
-      - display_url            (thumbnail / image fallback)
-      - display_resources[].src (image fallback)
-
-    NOT video_versions / image_versions2 (those are the private API fields).
-    """
-    # ── Video ────────────────────────────────────────────────────────────────
-    if item.get("is_video"):
-        video_resources = item.get("video_resources") or item.get("video_versions") or []
-        for vr in video_resources:
-            url = vr.get("src") or vr.get("url")
-            if url:
-                return url, ".mp4"
-
-    # ── Image / thumbnail ────────────────────────────────────────────────────
-    display_resources = item.get("display_resources") or []
-
-    # Prefer the highest-res display_resource
-    if display_resources:
-        best = max(display_resources, key=lambda r: r.get("config_width", 0))
-        url = best.get("src") or best.get("url")
-        if url:
-            return url, ".jpg"
-
-    # Plain display_url
-    url = item.get("display_url")
-    if url:
-        return url, ".jpg"
-
-    # Last resort: image_versions2 (private API shape)
-    iv2 = item.get("image_versions2")
-    if isinstance(iv2, dict):
-        candidates = iv2.get("candidates") or []
-        if candidates:
-            return candidates[0].get("url"), ".jpg"
-
-    return None, ".jpg"
-
-
-def fetch_instagram_post_graphql(url: str, url_key: str) -> "list[Path]":
-    """
-    Fetch a private/rate-limited post directly via GraphQL.
-    doc_id: scrape post page first, fall back to INSTAGRAM_POST_DOC_ID env var.
-    """
-    match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
-    if not match:
-        return []
-    shortcode = match.group(1)
-
-    post_doc_id = _scrape_post_doc_id(shortcode) or INSTAGRAM_POST_DOC_ID
-    if not post_doc_id:
-        return []
-
-    cookies = get_cookies_path()
-    variables = {
-        "shortcode": shortcode,
-        "fetch_tagged_user_count": None,
-        "hoisted_comment_id": None,
-        "hoisted_reply_id": None,
-    }
-    payload = _execute_graphql(post_doc_id, variables, cookies)
-    if not payload:
-        return []
-
-    data = payload.get("data", {})
-    media = (
-        data.get("xdt_api__v1__media__shortcode__web_info", {})
-        or data.get("shortcode_media")
-        or data
-    )
-    items = media.get("edge_sidecar_to_children", {}).get("edges", [])
-    nodes = [e["node"] for e in items if "node" in e] if items else [media]
-
-    downloaded: list[Path] = []
-    for idx, node in enumerate(nodes):
-        is_video = node.get("is_video", False)
-        media_url = node.get("video_url") if is_video else node.get("display_url")
-        ext = ".mp4" if is_video else ".jpg"
-        if not media_url:
-            continue
-        dest = DOWNLOAD_DIR / f"{url_key}_{idx:03d}{ext}"
-        try:
-            urllib.request.urlretrieve(media_url, dest)
-            downloaded.append(dest)
-        except Exception:
-            continue
-    return downloaded
 
 
 def fetch_instagram_stories(url: str, url_key: str) -> list[Path]:
     """
-    Private-story aware fetcher using the reels_media query_hash endpoint.
+    Try to download Instagram Stories via yt-dlp (requires cookies for
+    private/own stories; public stories sometimes work without them).
 
-    reel_ids MUST be a numeric integer — not a username string.
-    Media fields in story responses use video_resources/display_resources,
-    not video_versions/image_versions2.
+    Strategy:
+      1. Run yt-dlp -J to probe the story URL and get per-item entries.
+      2. Download each item with the best available format.
+      3. Return list of downloaded Paths.
+
+    Returns an empty list on any failure — caller should fall back to
+    the manual-paste DevTools flow.
     """
     cookies = get_cookies_path()
 
-    username, target_story_pk = extract_instagram_story_target(url)
-    if not username:
+    # Build base args tailored for Instagram stories
+    args = [
+        "--no-warnings",
+        "--rm-cache-dir",
+        "--no-cache-dir",
+        "--user-agent",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+        "Mobile/15E148 Safari/604.1",
+        "--add-header", "X-Ig-App-Id:936619743392459",
+        "--socket-timeout", "20",
+    ]
+    if cookies:
+        args += ["--cookies", str(cookies)]
+
+    # Probe first so we know how many items to expect
+    stdout, stderr, code = run_ytdlp(args + ["-J", "--flat-playlist", url])
+    if code != 0:
         return []
 
-    user_id = _resolve_instagram_user_id(username, cookies)
-    if not user_id or not str(user_id).isdigit():
+    try:
+        info = json.loads(stdout)
+    except Exception:
         return []
 
-    variables = {
-        "reel_ids": [int(user_id)],
-        "highlight_reel_ids": [],
-        "precomposed_overlay": False,
-    }
-    payload = _execute_graphql(
-        INSTAGRAM_STORY_QUERY_HASH,
-        variables,
-        cookies,
-        use_query_hash=True,
-    )
-    if not payload:
+    entries = info.get("entries") or ([info] if info.get("id") else [])
+    if not entries:
         return []
-
-    reels_media = (
-        payload.get("data", {}).get("reels_media")
-        or payload.get("data", {}).get("xdt_api__v1__feed__reels_media__connection", {}).get("reels_media")
-        or []
-    )
-    if not reels_media:
-        return []
-
-    items: list[dict] = []
-    for reel in reels_media:
-        items.extend(reel.get("items") or [])
-
-    if target_story_pk:
-        items = [
-            it for it in items
-            if str(it.get("pk") or it.get("id") or "") == str(target_story_pk)
-        ]
 
     downloaded: list[Path] = []
-    for idx, item in enumerate(items):
-        media_url, ext = _extract_story_media_url(item)
-        if not media_url:
-            continue
-        dest = DOWNLOAD_DIR / f"{url_key}_{idx:03d}{ext}"
-        try:
-            urllib.request.urlretrieve(media_url, dest)
-            downloaded.append(dest)
-        except Exception:
-            continue
+    for idx, entry in enumerate(entries):
+        entry_url = entry.get("url") or entry.get("webpage_url")
+        if not entry_url:
+            # Some entries only carry an id — reconstruct a usable story URL
+            entry_id = entry.get("id", "")
+            if entry_id:
+                entry_url = f"https://www.instagram.com/stories/item/{entry_id}/"
+            else:
+                continue
+
+        out_tpl = str(DOWNLOAD_DIR / f"{url_key}_{idx:03d}.%(ext)s")
+        dl_args = args + [
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+            "--merge-output-format", "mp4",
+            "--no-playlist",
+            "-o", out_tpl,
+            entry_url,
+        ]
+        _, _, dl_code = run_ytdlp(dl_args)
+        if dl_code == 0:
+            # Find what was actually written (ext may vary)
+            for p in DOWNLOAD_DIR.glob(f"{url_key}_{idx:03d}.*"):
+                if not p.name.endswith((".part", ".ytdl")):
+                    downloaded.append(p)
+                    break
 
     return downloaded
 
 
-def get_instagram_graphql_instructions(url: str) -> tuple["str | None", bool]:
+def get_instagram_graphql_instructions(url: str) -> tuple[str | None, bool]:
     """
-    Build a GraphQL URL for manual browser paste (fallback when auto-fetch fails).
-
-    For STORIES:
-      - Resolves numeric user_id (API + HTML scrape fallback).
-      - Only generates a link when user_id is numeric — no bogus username strings.
-
-    For POSTS:
-      - doc_id: scrape post page first, then INSTAGRAM_POST_DOC_ID env var.
+    Returns (graphql_api_url_for_manual_paste, is_story).
+    Tries to scrape a fresh doc_id from the post page so the link actually works.
+    Falls back to the last known working doc_id if scraping fails.
     """
+    import urllib.request as _req
+
     if is_instagram_story_url(url):
-        username, _ = extract_instagram_story_target(url)
-        if not username:
-            return None, True
-        cookies = get_cookies_path()
-        user_id = _resolve_instagram_user_id(username, cookies)
-        return _build_story_query_url(user_id), True
-
+        return None, True
     match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
     if not match:
         return None, False
     shortcode = match.group(1)
 
-    post_doc_id = _scrape_post_doc_id(shortcode) or INSTAGRAM_POST_DOC_ID
-    if not post_doc_id:
-        return None, False
+    # Try to scrape a live doc_id from the post page
+    doc_id = "8845758582119845"  # fallback
+    try:
+        page_url = f"https://www.instagram.com/p/{shortcode}/"
+        req = _req.Request(page_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        with _req.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        m = re.search(r'"doc_id"\s*:\s*"?(\d{10,})"?', html)
+        if m:
+            doc_id = m.group(1)
+    except Exception:
+        pass
 
     variables = {
         "shortcode": shortcode,
@@ -619,9 +358,8 @@ def get_instagram_graphql_instructions(url: str) -> tuple["str | None", bool]:
         "hoisted_comment_id": None,
         "hoisted_reply_id": None,
     }
-    encoded = urllib.parse.quote(json.dumps(variables, separators=(",", ":")))
-    return f"https://www.instagram.com/graphql/query/?doc_id={post_doc_id}&variables={encoded}", False
-
+    encoded_vars = urllib.parse.quote(json.dumps(variables))
+    return f"https://www.instagram.com/graphql/query/?doc_id={doc_id}&variables={encoded_vars}", False
 
 def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "all", is_raw_json: bool = False, dynamic_target_idx: str = None) -> list[Path]:
     downloaded_paths = []
@@ -629,93 +367,53 @@ def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "
         try:
             payload = json.loads(target_data)
 
-            # ── 1. Check for standard Story GraphQL structure first ──
-            reels = payload.get("data", {}).get("reels_media", []) or payload.get("data", {}).get("xdt_api__v1__feed__reels_media__connection", {}).get("reels_media", [])
-            story_items = []
-            if reels:
-                for reel in reels:
-                    story_items.extend(reel.get("items", []))
-            
-            unique_items = []
-            seen_urls = set()
-
-            if story_items:
-                # Standard story structure parsing
-                for item in story_items:
-                    v_url, i_url = None, None
-                    
-                    if item.get("is_video"):
-                        v_res = item.get("video_resources") or item.get("video_versions") or []
-                        if v_res:
-                            # Sort by width descending to get best quality
-                            v_res_sorted = sorted(v_res, key=lambda x: x.get("config_width", 0), reverse=True)
-                            v_url = v_res_sorted[0].get("src") or v_res_sorted[0].get("url")
-                    
-                    i_res = item.get("display_resources") or []
-                    if i_res:
-                        i_res_sorted = sorted(i_res, key=lambda x: x.get("config_width", 0), reverse=True)
-                        i_url = i_res_sorted[0].get("src") or i_res_sorted[0].get("url")
-                    if not i_url:
-                        i_url = item.get("display_url")
-
-                    primary = v_url if v_url else i_url
-                    if primary and primary not in seen_urls:
-                        seen_urls.add(primary)
-                        unique_items.append((item, v_url, i_url))
-            else:
-                # ── 2. Fallback to the recursive checker for Feed Posts / Carousels ──
-                def find_media_blocks(data):
-                    blocks = []
-                    if isinstance(data, dict):
-                        if any(k in data for k in ["video_versions", "image_versions2", "video_url", "display_url", "video_resources"]):
-                            if not any(k in data for k in ["shortcode_media", "xdt_api__v1__media__shortcode__web_info"]):
-                                blocks.append(data)
-                        if "carousel_media" in data and isinstance(data["carousel_media"], list):
-                            for item in data["carousel_media"]:
-                                blocks.extend(find_media_blocks(item))
-                        for v in data.values():
-                            blocks.extend(find_media_blocks(v))
-                    elif isinstance(data, list):
-                        for item in data:
+            def find_media_blocks(data):
+                blocks = []
+                if isinstance(data, dict):
+                    if any(k in data for k in ["video_versions", "image_versions2", "video_url", "display_url"]):
+                        if not any(k in data for k in ["shortcode_media", "xdt_api__v1__media__shortcode__web_info"]):
+                            blocks.append(data)
+                    if "carousel_media" in data and isinstance(data["carousel_media"], list):
+                        for item in data["carousel_media"]:
                             blocks.extend(find_media_blocks(item))
-                    return blocks
+                    for v in data.values():
+                        blocks.extend(find_media_blocks(v))
+                elif isinstance(data, list):
+                    for item in data:
+                        blocks.extend(find_media_blocks(item))
+                return blocks
 
-                media_items = find_media_blocks(payload)
-                if not media_items:
-                    root = payload.get("data", {})
-                    web_info = root.get("xdt_api__v1__media__shortcode__web_info", {})
-                    media_items = web_info.get("items", []) or payload.get("items", []) or root.get("shortcode_media", [])
-                    if isinstance(media_items, dict):
-                        media_items = [media_items]
+            media_items = find_media_blocks(payload)
+            if not media_items:
+                root = payload.get("data", {})
+                web_info = root.get("xdt_api__v1__media__shortcode__web_info", {})
+                media_items = web_info.get("items", []) or payload.get("items", []) or root.get("shortcode_media", [])
+                if isinstance(media_items, dict):
+                    media_items = [media_items]
 
-                normalized_items = []
-                for item in media_items:
-                    if isinstance(item, dict) and "node" in item:
-                        item = item["node"]
-                    if isinstance(item, dict):
-                        normalized_items.append(item)
+            normalized_items = []
+            for item in media_items:
+                if isinstance(item, dict) and "node" in item:
+                    item = item["node"]
+                if isinstance(item, dict):
+                    normalized_items.append(item)
 
-                for item in normalized_items:
-                    v_url = item.get("video_url")
-                    if not v_url and "video_versions" in item and item["video_versions"]:
-                        v_url = item["video_versions"][0].get("url")
-                    if not v_url and "video_resources" in item and item["video_resources"]:
-                        v_url = sorted(item["video_resources"], key=lambda x: x.get("config_width", 0), reverse=True)[0].get("src")
-                        
-                    i_url = None
-                    if "image_versions2" in item and item["image_versions2"].get("candidates"):
-                        i_url = item["image_versions2"]["candidates"][0].get("url")
-                    if not i_url and "display_resources" in item and item["display_resources"]:
-                        i_url = sorted(item["display_resources"], key=lambda x: x.get("config_width", 0), reverse=True)[0].get("src")
-                    if not i_url:
-                        i_url = item.get("display_url")
+            seen_urls = set()
+            unique_items = []
+            for item in normalized_items:
+                v_url = item.get("video_url")
+                if not v_url and "video_versions" in item and item["video_versions"]:
+                    v_url = item["video_versions"][0].get("url")
+                i_url = None
+                if "image_versions2" in item and item["image_versions2"].get("candidates"):
+                    i_url = item["image_versions2"]["candidates"][0].get("url")
+                if not i_url:
+                    i_url = item.get("display_url")
+                primary = v_url if v_url else i_url
+                if primary and primary not in seen_urls:
+                    seen_urls.add(primary)
+                    unique_items.append((item, v_url, i_url))
 
-                    primary = v_url if v_url else i_url
-                    if primary and primary not in seen_urls:
-                        seen_urls.add(primary)
-                        unique_items.append((item, v_url, i_url))
-
-            # ── 3. Download the resolved items ──
             for idx, (item, video_url, image_url) in enumerate(unique_items):
                 if dynamic_target_idx is not None and dynamic_target_idx != "all":
                     if int(dynamic_target_idx) != idx:
@@ -924,35 +622,31 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if files:
                 images = [f for f in files if f.suffix.lower() in IMAGE_EXTS]
                 videos = [f for f in files if f.suffix.lower() not in IMAGE_EXTS]
-                total  = len(files)
-                # All cases: store under "files" so handle_photo_pick serves them directly
-                ctx.user_data[url_key] = {"files": [str(p) for p in files]}
                 if images and not videos:
+                    ctx.user_data[url_key] = {"files": [str(p) for p in images]}
                     await msg.edit_text(
-                        f"🖼 Found {total} photo(s):",
-                        reply_markup=build_photo_picker(url_key, total)
+                        f"🖼 Found {len(images)} photo(s):",
+                        reply_markup=build_photo_picker(url_key, len(images))
                     )
-                elif videos and not images and total == 1:
-                    if videos[0].stat().st_size <= TELEGRAM_MAX_BYTES:
-                        await msg.edit_text("📤 Uploading...")
-                        with open(videos[0], "rb") as fh:
-                            await msg.reply_video(video=fh, supports_streaming=True,
-                                                  read_timeout=600, write_timeout=600)
-                        await msg.delete()
-                        videos[0].unlink(missing_ok=True)
-                        ctx.user_data.pop(url_key, None)
-                    else:
-                        dl_url = generate_download_link(videos[0])
-                        await msg.edit_text(
-                            f"📦 Video too large for Telegram.\n🔗 [Download directly]({dl_url})",
-                            parse_mode="Markdown"
-                        )
+                elif videos and not images:
+                    # single video — go straight to quality picker via normal probe path
+                    for f in files:
+                        f.unlink(missing_ok=True)
+                    # fall through to probe_url below by clearing files
+                    files = None
                 else:
-                    # multiple videos or mixed carousel — let user pick
-                    label = (f"🎥 Found {total} video(s):" if not images
-                             else f"📦 Found {len(images)} photo(s) and {len(videos)} video(s):")
-                    await msg.edit_text(label, reply_markup=build_photo_picker(url_key, total))
-                return
+                    # mixed carousel
+                    img_c = len(images)
+                    vid_c = len(videos)
+                    ctx.user_data[url_key] = {"raw_json": json.dumps({"_prefetched_files": [str(f) for f in files]}), "is_raw": False, "_files": [str(f) for f in files]}
+                    await msg.edit_text(
+                        f"📊 **Instagram post fetched**\nFound {img_c} photo(s) and {vid_c} video(s).",
+                        reply_markup=build_dynamic_instagram_keyboard(url_key, img_c, vid_c),
+                        parse_mode="Markdown"
+                    )
+                    return
+                if files:
+                    return
 
         # ── Stories: try automatic yt-dlp download first ──────────────────────
         if is_instagram_story_url(url):
@@ -999,86 +693,28 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     parse_mode="Markdown"
                 )
                 return
-            # Auto-download failed — generate a clickable GraphQL link; DevTools as last resort
-            api_url, _ = get_instagram_graphql_instructions(url)
-            if api_url:
-                instructions = (
-                    "👻 **Instagram Story Detected**\n\n"
-                    "Automatic download failed.\n\n"
-                    "Open this link **while logged into Instagram** in your browser:\n"
-                    f"[📡 Story GraphQL Payload]({api_url})\n\n"
-                    "Then copy the full JSON response (**Ctrl+A** → **Ctrl+C**) and paste it here."
-                )
-            else:
-                instructions = (
-                    "👻 **Instagram Story Detected**\n\n"
-                    "Automatic download failed (stories require a logged-in session).\n\n"
-                    "**Manual steps:**\n"
-                    "1. Open the Story in your browser → **F12** → Network tab.\n"
-                    "2. Filter by `reels_media` or `graphql`.\n"
-                    "3. Refresh (**Ctrl+R**), copy the full **Response** JSON.\n"
-                    "4. **Paste or upload it here.**"
-                )
+            # Auto-download failed — fall through to manual paste instructions
+            instructions = (
+                "👻 **Instagram Story Detected**\n\n"
+                "Automatic download failed (stories require a logged-in session).\n\n"
+                "**Manual steps:**\n"
+                "1. Open the Story in your browser and press **F12** → Network tab.\n"
+                "2. Filter requests by `reels_media` or `graphql`.\n"
+                "3. Refresh (**Ctrl+R**), then copy the full **Response** of the matching request.\n"
+                "4. **Paste or upload that JSON text** directly into this chat."
+            )
             await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
             return
 
         # ── Non-story private/rate-limited fallback ────────────────────────────
-        # Attempt 1: auto-fetch via GraphQL (scrape doc_id → env fallback)
-        await msg.edit_text("🔒 Post is private or rate-limited — trying GraphQL fetch...")
-        gql_files = await asyncio.get_event_loop().run_in_executor(
-            None, fetch_instagram_post_graphql, url, url_key
-        )
-        if gql_files:
-            images = [f for f in gql_files if f.suffix.lower() in IMAGE_EXTS]
-            videos = [f for f in gql_files if f.suffix.lower() not in IMAGE_EXTS]
-            total  = len(gql_files)
-            ctx.user_data[url_key] = {"files": [str(p) for p in gql_files]}
-            if images and not videos:
-                await msg.edit_text(
-                    f"🖼 Found {total} photo(s):",
-                    reply_markup=build_photo_picker(url_key, total)
-                )
-            elif videos and not images and total == 1:
-                if videos[0].stat().st_size <= TELEGRAM_MAX_BYTES:
-                    await msg.edit_text("📤 Uploading...")
-                    with open(videos[0], "rb") as fh:
-                        await msg.reply_video(video=fh, supports_streaming=True,
-                                              read_timeout=600, write_timeout=600)
-                    await msg.delete()
-                    videos[0].unlink(missing_ok=True)
-                    ctx.user_data.pop(url_key, None)
-                else:
-                    dl_url = generate_download_link(videos[0])
-                    await msg.edit_text(
-                        f"📦 Video too large for Telegram.\n🔗 [Download directly]({dl_url})",
-                        parse_mode="Markdown"
-                    )
-            else:
-                label = (f"🎥 Found {total} video(s):" if not images
-                         else f"📦 Found {len(images)} photo(s) and {len(videos)} video(s):")
-                await msg.edit_text(label, reply_markup=build_photo_picker(url_key, total))
-            return
-
-        # Attempt 2: manual paste — generate a clickable GraphQL link
         api_url, _ = get_instagram_graphql_instructions(url)
-        if api_url:
-            instructions = (
-                "🔒 **Private Instagram Post Detected**\n\n"
-                "Automatic fetch failed — this post is private or heavily rate-limited.\n\n"
-                f"1. Open this link while logged in: [GraphQL Payload]({api_url})\n"
-                "2. Copy the full JSON response (**Ctrl+A**, **Ctrl+C**).\n"
-                "3. **Paste or upload the text** right here in this chat."
-            )
-        else:
-            instructions = (
-                "🔒 **Private Instagram Post Detected**\n\n"
-                "Direct fetch didn't work and no GraphQL URL could be generated.\n\n"
-                "**Manual steps:**\n"
-                "1. Open the post in your browser and press **F12** → Network tab.\n"
-                "2. Filter requests by `graphql`.\n"
-                "3. Reload and copy the full **Response** JSON.\n"
-                "4. **Paste or upload the text** right here in this chat."
-            )
+        instructions = (
+            "🔒 **Private Instagram Post Detected**\n\n"
+            "Direct fetch didn't work — this post is likely private or rate-limited.\n\n"
+            f"1. Open this link: [GraphQL Payload]({api_url})\n"
+            "2. Select all text and copy (**Ctrl+A**, **Ctrl+C**).\n"
+            "3. **Paste or upload the text** right here in this chat stream."
+        )
         await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
         return
         
@@ -1262,53 +898,10 @@ async def handle_photo_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         for fp in all_files: fp.unlink(missing_ok=True)
     ctx.user_data.pop(url_key, None)
 
-async def debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    import shutil
-    lines = []
-    # Cookie file status
-    render_path = Path("/etc/secrets/youtube_cookies.txt")
-    runtime_path = DOWNLOAD_DIR / "youtube_cookies.txt"
-    lines.append(f"Render secret exists: {render_path.exists()}")
-    if render_path.exists():
-        lines.append(f"Render secret size: {render_path.stat().st_size} bytes")
-        first = render_path.read_text(encoding="utf-8", errors="replace")[:80]
-        lines.append(f"First 80 chars: {repr(first)}")
-    lines.append(f"Runtime cookie exists: {runtime_path.exists()}")
-    active = DOWNLOAD_DIR / "active_cookies.txt"
-    lines.append(f"Active cookie exists: {active.exists()}")
-    # yt-dlp test on instagram
-    stdout, stderr, code = run_ytdlp([
-        "--no-warnings", "--no-check-certificates",
-        "--user-agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-        "--add-header", f"X-Ig-App-Id:{INSTAGRAM_APP_ID}",
-        "--socket-timeout", "15",
-        "--no-playlist",
-        "-J", "https://www.instagram.com/p/DZvyyGYDKD5/",
-    ])
-    lines.append(f"yt-dlp exit code (no cookies): {code}")
-    lines.append(f"stderr: {stderr.strip()[:200]}")
-    cookies = get_cookies_path()
-    if cookies:
-        stdout2, stderr2, code2 = run_ytdlp([
-            "--no-warnings", "--no-check-certificates",
-            "--user-agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-            "--add-header", f"X-Ig-App-Id:{INSTAGRAM_APP_ID}",
-            "--cookies", str(cookies),
-            "--socket-timeout", "15",
-            "--no-playlist",
-            "-J", "https://www.instagram.com/p/DZvyyGYDKD5/",
-        ])
-        lines.append(f"yt-dlp exit code (WITH cookies): {code2}")
-        lines.append(f"stderr: {stderr2.strip()[:200]}")
-    else:
-        lines.append("No cookies file found — skipping cookie test")
-    await update.message.reply_text("\n".join(lines))
-
 def main() -> None:
     threading.Thread(target=run_health_server, daemon=True).start()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("debug", debug))
     app.add_handler(MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, handle_input))
     app.add_handler(CallbackQueryHandler(handle_download, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(handle_photo_pick, pattern=r"^pick\|"))
