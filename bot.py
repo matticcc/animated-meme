@@ -142,10 +142,12 @@ def base_args(url: str) -> list[str]:
         "--no-cache-dir"
     ]
     
-    # FIX FOR YOUTUBE FORMAT DECRYPTION WALL
     if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        # Tells yt-dlp to bypass desktop requirements and request mobile streaming blocks
-        args += ["--extractor-args", "youtube:client=ios"]
+        # FORCES REMOTELY SOLVED JS SIGNATURE CHALLENGES & BYPASSES MISSING RENDER RUNTIMES
+        args += [
+            "--remote-components", "ejs:github",
+            "--extractor-args", "youtube:player_client=default,ios;formats=missing_pot"
+        ]
         
     elif "tiktok.com" in url.lower():
         args += ["--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"]
