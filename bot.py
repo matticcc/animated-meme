@@ -145,13 +145,15 @@ def base_args(url: str) -> list[str]:
     is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
 
     if is_youtube:
-        # 1. Force the specialized Android VR / Mobile framework to bypass JS player checks
-        args += ["--extractor-args", "youtube:player_client=android_vr,android;formats=missing_pot"]
+        # tv_downgraded bypasses player challenges by requesting legacy static streams
+        args += [
+            "--extractor-args", 
+            "youtube:player_client=tv_downgraded,web_embedded;formats=missing_pot"
+        ]
         
-        # 2. STRICLY target ONLY the dedicated youtube_cookies file for YouTube requests
+        # Pull your dedicated youtube_cookies mapping file cleanly
         yt_cookies_path = DOWNLOAD_DIR / "youtube_cookies.txt"
         if not yt_cookies_path.exists() and _RENDER_COOKIES.exists():
-            # If deployed via Render Environment Secret, ensure copy integrity
             try:
                 yt_cookies_path.write_text(_RENDER_COOKIES.read_text(encoding="utf-8"), encoding="utf-8")
             except Exception:
