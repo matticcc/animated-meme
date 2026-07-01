@@ -244,11 +244,16 @@ def base_args(url: str) -> list[str]:
     return args
 
 def run_ytdlp(args: list[str]) -> tuple[str, str, int]:
-    result = subprocess.run(
-        ["yt-dlp"] + args,
-        capture_output=True, text=True, timeout=600,
-    )
-    return result.stdout, result.stderr, result.returncode
+    try:
+        result = subprocess.run(
+            ["yt-dlp"] + args,
+            capture_output=True, text=True, timeout=600,
+        )
+        return result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired:
+        return "", "ERROR: yt-dlp timed out after 600s", 1
+    except Exception as e:
+        return "", f"ERROR: {type(e).__name__}: {e}", 1
 
 def run_gallerydl(url: str, out_dir: Path) -> tuple[str, str, int]:
     result = subprocess.run(
