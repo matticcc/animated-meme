@@ -624,6 +624,61 @@ def generate_download_link(filepath: Path) -> str:
         return f"{RENDER_EXTERNAL_URL}/download/{safe_name}"
     return f"http://localhost:{PORT}/download/{safe_name}"
 
+def generate_paste_link(url_key: str) -> str:
+    if RENDER_EXTERNAL_URL:
+        return f"{RENDER_EXTERNAL_URL}/paste/{url_key}"
+    return f"http://localhost:{PORT}/paste/{url_key}"
+
+async def wait_for_pasted_json(url_key: str, timeout: float = 900, interval: float = 1.5) -> str | None:
+    """Poll for the paste_<key>.json file the web paste page writes. Returns
+    the pasted text once it shows up (and deletes the file), or None if the
+    user never submits within `timeout` seconds."""
+    path = DOWNLOAD_DIR / f"paste_{url_key}.json"
+    waited = 0.0
+    while waited < timeout:
+        if path.exists():
+            try:
+                text = path.read_text(encoding="utf-8")
+            except Exception:
+                text = None
+            path.unlink(missing_ok=True)
+            return text
+        await asyncio.sleep(interval)
+        waited += interval
+    return None
+
+async def process_pasted_instagram_json(msg, url_key: str, user_data: dict, raw_text: str) -> None:
+    """Shared logic for handling a pasted GraphQL/API JSON blob, whether it
+    arrived by chat message or via the web paste page."""
+    user_data[url_key] = {"raw_json": raw_text, "is_raw": True}
+    img_c = max(raw_text.count('"display_url"'), raw_text.count('"image_versions2"'), raw_text.count('"display_resources"'))
+    vid_c = max(raw_text.count('"video_url"'), raw_text.count('"video_versions"'), raw_text.count('"video_resources"'))
+    if vid_c > 0 and img_c >= vid_c: img_c -= vid_c
+    if img_c == 0 and vid_c == 0: img_c, vid_c = 1, 1
+    await msg.edit_text(
+        f"📊 **Instagram Layout Data Parsed**\nFound {img_c} photos and {vid_c} videos.",
+        reply_markup=build_dynamic_instagram_keyboard(url_key, img_c, vid_c), parse_mode="Markdown"
+    )
+
+async def launch_paste_listener(msg, url_key: str, user_data: dict) -> None:
+    """Background task: waits for the user to submit JSON via the web paste
+    page, then processes it automatically — no need to come back and paste
+    into chat manually."""
+    raw_text = await wait_for_pasted_json(url_key)
+    if not raw_text:
+        try:
+            await msg.edit_text("⌛ Paste link expired — send the URL again to retry.")
+        except Exception:
+            pass
+        return
+    try:
+        await process_pasted_instagram_json(msg, url_key, user_data, raw_text)
+    except Exception as e:
+        try:
+            await msg.edit_text(f"❌ Failed to parse pasted data: {e}")
+        except Exception:
+            pass
+            
 async def send_photos(message, files: list[Path]) -> None:
     if not files: return
     if len(files) == 1:
