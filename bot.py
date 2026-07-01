@@ -366,33 +366,72 @@ def fetch_instagram_stories(url: str, url_key: str) -> tuple[list[Path], str]:
     return [], clean_errors(stderr) if code != 0 else "No story items returned."
 
 
-def get_instagram_user_pk(username: str) -> str | None:
+def get_instagram_user_pk(username: str) -> tuple[str | None, str]:
     """Resolve a username to its numeric Instagram user id (needed for the
     reel_ids story GraphQL query). This just reads public profile metadata —
     the same info any browser gets loading the profile page — it does not
-    fetch any story content itself."""
-    import urllib.request as _req
+    fetch any story content itself.
 
-    api_url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={urllib.parse.quote(username)}"
+    Returns (pk_or_None, error_reason). error_reason is only meaningful when
+    pk is None, so callers/logs can tell *why* it failed instead of guessing."""
+    import urllib.request as _req
+    import http.cookiejar
+
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
                       "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
                       "Mobile/15E148 Safari/604.1",
         "X-Ig-App-Id": "936619743392459",
         "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
     }
+
+    opener = _req.build_opener()
+    cookies = get_cookies_path()
+    if cookies:
+        try:
+            jar = http.cookiejar.MozillaCookieJar(str(cookies))
+            jar.load(ignore_discard=True, ignore_expires=True)
+            opener = _req.build_opener(_req.HTTPCookieProcessor(jar))
+        except Exception as e:
+            print(f"⚠️ IG cookie jar load failed for pk lookup: {e}")
+
+    # Attempt 1: mobile web_profile_info API (fast, structured)
+    api_url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={urllib.parse.quote(username)}"
     try:
         req = _req.Request(api_url, headers=headers)
-        with _req.urlopen(req, timeout=10) as resp:
+        with opener.open(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-        return str(data["data"]["user"]["id"])
-    except Exception:
-        return None
+        pk = data.get("data", {}).get("user", {}).get("id")
+        if pk:
+            return str(pk), ""
+    except Exception as e:
+        api_error = f"{type(e).__name__}: {e}"
+        print(f"⚠️ IG web_profile_info lookup failed for '{username}': {api_error}")
+    else:
+        api_error = "web_profile_info returned no user id (account may not exist)"
+
+    # Attempt 2: scrape the profile page HTML for the embedded numeric id
+    try:
+        page_headers = dict(headers)
+        page_headers["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+        req = _req.Request(f"https://www.instagram.com/{urllib.parse.quote(username)}/", headers=page_headers)
+        with opener.open(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        m = re.search(r'"profilePage_(\d+)"', html) or re.search(r'"id"\s*:\s*"(\d+)"\s*,\s*"username"\s*:\s*"' + re.escape(username), html)
+        if m:
+            return m.group(1), ""
+        return None, api_error
+    except Exception as e:
+        return None, f"{api_error}; page scrape also failed: {type(e).__name__}: {e}"
 
 
-def get_instagram_graphql_instructions(url: str) -> tuple[str | None, bool]:
+def get_instagram_graphql_instructions(url: str) -> tuple[str | None, bool, str]:
     """
-    Returns (graphql_api_url_for_manual_paste, is_story).
+    Returns (graphql_api_url_for_manual_paste, is_story, error_reason).
     For posts: tries to scrape a fresh doc_id from the post page so the link
     actually works, falling back to the last known working doc_id.
     For stories: builds a reel_ids query. The link still has to be opened by
@@ -406,11 +445,11 @@ def get_instagram_graphql_instructions(url: str) -> tuple[str | None, bool]:
     if is_instagram_story_url(url):
         m = re.search(r"instagram\.com/stories/([^/?#&]+)/", url)
         if not m:
-            return None, True
+            return None, True, "Couldn't parse a username out of that story URL."
         username = m.group(1)
-        pk = get_instagram_user_pk(username)
+        pk, pk_error = get_instagram_user_pk(username)
         if not pk:
-            return None, True
+            return None, True, pk_error or "Unknown lookup failure."
         variables = {
             "reel_ids": [int(pk)],
             "highlight_reel_ids": [],
@@ -421,10 +460,11 @@ def get_instagram_graphql_instructions(url: str) -> tuple[str | None, bool]:
             f"https://www.instagram.com/graphql/query/"
             f"?query_hash=de8017ee0a7c9c45ec4260733d81ea31&variables={encoded_vars}",
             True,
+            "",
         )
     match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
     if not match:
-        return None, False
+        return None, False, "Couldn't parse a shortcode out of that URL."
     shortcode = match.group(1)
 
     # Try to scrape a live doc_id from the post page
@@ -452,7 +492,7 @@ def get_instagram_graphql_instructions(url: str) -> tuple[str | None, bool]:
         "hoisted_reply_id": None,
     }
     encoded_vars = urllib.parse.quote(json.dumps(variables))
-    return f"https://www.instagram.com/graphql/query/?doc_id={doc_id}&variables={encoded_vars}", False
+    return f"https://www.instagram.com/graphql/query/?doc_id={doc_id}&variables={encoded_vars}", False, ""
 
 def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "all", is_raw_json: bool = False, dynamic_target_idx: str = None) -> list[Path]:
     downloaded_paths = []
@@ -841,7 +881,7 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 return
             # Auto-download failed — fall back to the GraphQL link + paste page
-            api_url, _ = get_instagram_graphql_instructions(url)
+            api_url, _, lookup_error = get_instagram_graphql_instructions(url)
             paste_url = generate_paste_link(url_key)
             if api_url:
                 instructions = (
@@ -859,14 +899,13 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 instructions = (
                     "👻 **Instagram Story Detected**\n\n"
-                    "Couldn't resolve this account to build a data link — it may not exist "
-                    "or Instagram is rate-limiting lookups right now. Try again shortly."
+                    f"Couldn't resolve this account to build a data link:\n`{lookup_error}`"
                 )
             await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
             return
 
         # ── Non-story private/rate-limited fallback ────────────────────────────
-        api_url, _ = get_instagram_graphql_instructions(url)
+        api_url, _, _ = get_instagram_graphql_instructions(url)
         paste_url = generate_paste_link(url_key)
         instructions = (
             "🔒 **Private Instagram Post Detected**\n\n"
