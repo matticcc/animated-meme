@@ -819,16 +819,27 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 return
             # Auto-download failed — fall through to manual paste instructions
+            api_url, _ = get_instagram_graphql_instructions(url)
             paste_url = generate_paste_link(url_key)
-            instructions = (
-                "👻 **Instagram Story Detected**\n\n"
-                "Automatic download failed (stories require a logged-in session).\n\n"
-                "**Manual steps:**\n"
-                "1. Open the Story in your browser and press **F12** → Network tab.\n"
-                "2. Filter requests by `reels_media` or `graphql`.\n"
-                "3. Refresh (**Ctrl+R**), then copy the full **Response** of the matching request.\n"
-                "4. **Paste or upload that JSON text** directly into this chat."
-            )
+            if api_url:
+                instructions = (
+                    "👻 **Instagram Story Detected**\n\n"
+                    f"Automatic download failed ({story_error or 'stories need a logged-in session'}).\n\n"
+                    "**Steps:**\n"
+                    f"1. Open this link: [Story GraphQL Data]({api_url})\n"
+                    "   — open it in a browser where *you're* logged into an account "
+                    "that already has access to this story (if it's private, an account following them).\n"
+                    "2. Select all and copy the page contents.\n"
+                    f"3. Paste it in the [web paste page]({paste_url}) — works on mobile — "
+                    "and it'll continue automatically. (Pasting directly into this chat still works too.)"
+                )
+                asyncio.create_task(launch_paste_listener(msg, url_key, ctx.user_data))
+            else:
+                instructions = (
+                    "👻 **Instagram Story Detected**\n\n"
+                    "Couldn't resolve this account to build a data link — it may not exist "
+                    "or Instagram is rate-limiting lookups right now. Try again shortly."
+                )
             await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
             return
 
@@ -840,8 +851,10 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "Direct fetch didn't work — this post is likely private or rate-limited.\n\n"
             f"1. Open this link: [GraphQL Payload]({api_url})\n"
             "2. Select all text and copy (**Ctrl+A**, **Ctrl+C**).\n"
-            "3. **Paste or upload the text** right here in this chat stream."
+            f"3. Paste it in the [web paste page]({paste_url}) — works on mobile — "
+            "and it'll continue automatically. (Pasting directly into this chat still works too.)"
         )
+        asyncio.create_task(launch_paste_listener(msg, url_key, ctx.user_data))
         await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
         return
         
