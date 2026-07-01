@@ -10,6 +10,7 @@ import urllib.request
 import urllib.parse
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application,
@@ -39,6 +40,7 @@ KNOWN_SITES: dict[str, str] = {
     "tiktok.com":  "TikTok",
     "redgifs.com": "RedGifs",
     "instagram.com": "Instagram",
+    "pornhub.com": "PornHub",
 }
 
 ALLOWED_DOMAINS = set(KNOWN_SITES.keys())
@@ -74,8 +76,50 @@ def get_cookies_path() -> Path | None:
 
 # ── Health-check & File Server ────────────────────────────────────────────────
 
+PASTE_PAGE_HTML = """<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paste JSON</title>
+<style>
+body{font-family:-apple-system,sans-serif;background:#111;color:#eee;padding:16px;margin:0}
+h3{font-size:16px}
+textarea{width:100%;height:55vh;box-sizing:border-box;background:#1c1c1c;color:#eee;
+  border:1px solid #444;border-radius:8px;padding:10px;font-size:14px}
+button{width:100%;padding:14px;margin-top:12px;font-size:16px;border:none;border-radius:8px;
+  background:#2ea6ff;color:#fff}
+#status{margin-top:12px;text-align:center;font-size:15px}
+</style></head>
+<body>
+<h3>Paste the copied JSON response below, then submit</h3>
+<textarea id="j" placeholder="Long-press → Paste here..."></textarea>
+<button onclick="submitIt()">Submit to bot</button>
+<div id="status"></div>
+<script>
+async function submitIt(){
+  const v = document.getElementById('j').value;
+  const s = document.getElementById('status');
+  s.textContent = 'Sending...';
+  try {
+    const r = await fetch('/submit/__KEY__', {method:'POST', body: v});
+    s.textContent = r.ok ? '✅ Sent! You can go back to Telegram now.' : '❌ Failed, try again.';
+  } catch (e) {
+    s.textContent = '❌ Failed, try again.';
+  }
+}
+</script>
+</body></html>"""
+
 class CombinedServerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/paste/"):
+            key = urllib.parse.unquote(self.path.split("/paste/", 1)[1]).strip("/")
+            key = re.sub(r"[^A-Za-z0-9_\-]", "", key)
+            body = PASTE_PAGE_HTML.replace("__KEY__", key).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path.startswith("/download/"):
             try:
                 filename = urllib.parse.unquote(self.path.split("/download/", 1)[1])
@@ -97,11 +141,38 @@ class CombinedServerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
 
+    def do_POST(self):
+        if self.path.startswith("/submit/"):
+            key = urllib.parse.unquote(self.path.split("/submit/", 1)[1]).strip("/")
+            key = re.sub(r"[^A-Za-z0-9_\-]", "", key)
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body_text = self.rfile.read(length).decode("utf-8", errors="ignore")
+            except Exception:
+                body_text = ""
+            ok = bool(key) and bool(body_text.strip())
+            if ok:
+                try:
+                    (DOWNLOAD_DIR / f"paste_{key}.json").write_text(body_text, encoding="utf-8")
+                except Exception:
+                    ok = False
+            resp = b"OK" if ok else b"EMPTY"
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+        self.send_error(404, "Not Found")
+
     def log_message(self, *args):
         pass
 
+class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
 def run_health_server():
-    HTTPServer(("0.0.0.0", PORT), CombinedServerHandler).serve_forever()
+    _ThreadingHTTPServer(("0.0.0.0", PORT), CombinedServerHandler).serve_forever()
 
 # ── Extraction helpers ─────────────────────────────────────────────────────────
 
@@ -245,22 +316,23 @@ def is_instagram_story_url(url: str) -> bool:
     )
 
 
-def fetch_instagram_stories(url: str, url_key: str) -> list[Path]:
+def fetch_instagram_stories(url: str, url_key: str) -> tuple[list[Path], str]:
     """
-    Try to download Instagram Stories via yt-dlp (requires cookies for
-    private/own stories; public stories sometimes work without them).
+    Try to download Instagram Stories via yt-dlp's native "instagram:story"
+    extractor. Instagram requires a logged-in session to view *any* story
+    (public accounts included), so this needs valid cookies — the same
+    cookies file already used elsewhere in the bot for the account you're
+    running it as.
 
-    Strategy:
-      1. Run yt-dlp -J to probe the story URL and get per-item entries.
-      2. Download each item with the best available format.
-      3. Return list of downloaded Paths.
-
-    Returns an empty list on any failure — caller should fall back to
-    the manual-paste DevTools flow.
+    Returns (downloaded_paths, error_message). error_message is only
+    meaningful when downloaded_paths is empty, so the caller can show the
+    real reason (missing cookies, expired session, etc.) instead of a
+    generic failure.
     """
     cookies = get_cookies_path()
+    if not cookies:
+        return [], "No Instagram session cookies configured — stories require a logged-in account."
 
-    # Build base args tailored for Instagram stories
     args = [
         "--no-warnings",
         "--rm-cache-dir",
@@ -271,64 +343,85 @@ def fetch_instagram_stories(url: str, url_key: str) -> list[Path]:
         "Mobile/15E148 Safari/604.1",
         "--add-header", "X-Ig-App-Id:936619743392459",
         "--socket-timeout", "20",
+        "--cookies", str(cookies),
     ]
-    if cookies:
-        args += ["--cookies", str(cookies)]
 
-    # Probe first so we know how many items to expect
-    stdout, stderr, code = run_ytdlp(args + ["-J", "--flat-playlist", url])
-    if code != 0:
-        return []
+    # Download directly in one pass — let yt-dlp enumerate every item in the
+    # story reel itself instead of us trying to reconstruct per-item URLs.
+    out_tpl = str(DOWNLOAD_DIR / f"{url_key}_%(autonumber)03d.%(ext)s")
+    dl_args = args + [
+        "--merge-output-format", "mp4",
+        "--yes-playlist",
+        "-o", out_tpl,
+        url,
+    ]
+    _, stderr, code = run_ytdlp(dl_args)
 
+    downloaded = [
+        p for p in DOWNLOAD_DIR.glob(f"{url_key}_*")
+        if not p.name.endswith((".part", ".ytdl"))
+    ]
+    if downloaded:
+        return downloaded, ""
+    return [], clean_errors(stderr) if code != 0 else "No story items returned."
+
+
+def get_instagram_user_pk(username: str) -> str | None:
+    """Resolve a username to its numeric Instagram user id (needed for the
+    reel_ids story GraphQL query). This just reads public profile metadata —
+    the same info any browser gets loading the profile page — it does not
+    fetch any story content itself."""
+    import urllib.request as _req
+
+    api_url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={urllib.parse.quote(username)}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                      "Mobile/15E148 Safari/604.1",
+        "X-Ig-App-Id": "936619743392459",
+        "Accept": "application/json",
+    }
     try:
-        info = json.loads(stdout)
+        req = _req.Request(api_url, headers=headers)
+        with _req.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        return str(data["data"]["user"]["id"])
     except Exception:
-        return []
-
-    entries = info.get("entries") or ([info] if info.get("id") else [])
-    if not entries:
-        return []
-
-    downloaded: list[Path] = []
-    for idx, entry in enumerate(entries):
-        entry_url = entry.get("url") or entry.get("webpage_url")
-        if not entry_url:
-            # Some entries only carry an id — reconstruct a usable story URL
-            entry_id = entry.get("id", "")
-            if entry_id:
-                entry_url = f"https://www.instagram.com/stories/item/{entry_id}/"
-            else:
-                continue
-
-        out_tpl = str(DOWNLOAD_DIR / f"{url_key}_{idx:03d}.%(ext)s")
-        dl_args = args + [
-            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-            "--merge-output-format", "mp4",
-            "--no-playlist",
-            "-o", out_tpl,
-            entry_url,
-        ]
-        _, _, dl_code = run_ytdlp(dl_args)
-        if dl_code == 0:
-            # Find what was actually written (ext may vary)
-            for p in DOWNLOAD_DIR.glob(f"{url_key}_{idx:03d}.*"):
-                if not p.name.endswith((".part", ".ytdl")):
-                    downloaded.append(p)
-                    break
-
-    return downloaded
+        return None
 
 
 def get_instagram_graphql_instructions(url: str) -> tuple[str | None, bool]:
     """
     Returns (graphql_api_url_for_manual_paste, is_story).
-    Tries to scrape a fresh doc_id from the post page so the link actually works.
-    Falls back to the last known working doc_id if scraping fails.
+    For posts: tries to scrape a fresh doc_id from the post page so the link
+    actually works, falling back to the last known working doc_id.
+    For stories: builds a reel_ids query. The link still has to be opened by
+    the user in a browser where THEY are logged into an Instagram account
+    that already has access to that story (their own account, or an account
+    already following the private user) — this bot never authenticates as
+    anyone, it just formats the request for you to open and copy back.
     """
     import urllib.request as _req
 
     if is_instagram_story_url(url):
-        return None, True
+        m = re.search(r"instagram\.com/stories/([^/?#&]+)/", url)
+        if not m:
+            return None, True
+        username = m.group(1)
+        pk = get_instagram_user_pk(username)
+        if not pk:
+            return None, True
+        variables = {
+            "reel_ids": [int(pk)],
+            "highlight_reel_ids": [],
+            "precomposed_overlay": False,
+        }
+        encoded_vars = urllib.parse.quote(json.dumps(variables))
+        return (
+            f"https://www.instagram.com/graphql/query/"
+            f"?query_hash=de8017ee0a7c9c45ec4260733d81ea31&variables={encoded_vars}",
+            True,
+        )
     match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
     if not match:
         return None, False
@@ -370,7 +463,7 @@ def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "
             def find_media_blocks(data):
                 blocks = []
                 if isinstance(data, dict):
-                    if any(k in data for k in ["video_versions", "image_versions2", "video_url", "display_url"]):
+                    if any(k in data for k in ["video_versions", "image_versions2", "video_url", "display_url", "video_resources", "display_resources"]):
                         if not any(k in data for k in ["shortcode_media", "xdt_api__v1__media__shortcode__web_info"]):
                             blocks.append(data)
                     if "carousel_media" in data and isinstance(data["carousel_media"], list):
@@ -404,11 +497,16 @@ def parse_and_download_instagram(target_data: str, url_key: str, choice: str = "
                 v_url = item.get("video_url")
                 if not v_url and "video_versions" in item and item["video_versions"]:
                     v_url = item["video_versions"][0].get("url")
+                if not v_url and item.get("video_resources"):
+                    # Story GraphQL shape (reel_ids query) — last entry is usually highest-res
+                    v_url = item["video_resources"][-1].get("src")
                 i_url = None
                 if "image_versions2" in item and item["image_versions2"].get("candidates"):
                     i_url = item["image_versions2"]["candidates"][0].get("url")
                 if not i_url:
                     i_url = item.get("display_url")
+                if not i_url and item.get("display_resources"):
+                    i_url = item["display_resources"][-1].get("src")
                 primary = v_url if v_url else i_url
                 if primary and primary not in seen_urls:
                     seen_urls.add(primary)
@@ -554,6 +652,61 @@ def generate_download_link(filepath: Path) -> str:
         return f"{RENDER_EXTERNAL_URL}/download/{safe_name}"
     return f"http://localhost:{PORT}/download/{safe_name}"
 
+def generate_paste_link(url_key: str) -> str:
+    if RENDER_EXTERNAL_URL:
+        return f"{RENDER_EXTERNAL_URL}/paste/{url_key}"
+    return f"http://localhost:{PORT}/paste/{url_key}"
+
+async def wait_for_pasted_json(url_key: str, timeout: float = 900, interval: float = 1.5) -> str | None:
+    """Poll for the paste_<key>.json file the web paste page writes. Returns
+    the pasted text once it shows up (and deletes the file), or None if the
+    user never submits within `timeout` seconds."""
+    path = DOWNLOAD_DIR / f"paste_{url_key}.json"
+    waited = 0.0
+    while waited < timeout:
+        if path.exists():
+            try:
+                text = path.read_text(encoding="utf-8")
+            except Exception:
+                text = None
+            path.unlink(missing_ok=True)
+            return text
+        await asyncio.sleep(interval)
+        waited += interval
+    return None
+
+async def process_pasted_instagram_json(msg, url_key: str, user_data: dict, raw_text: str) -> None:
+    """Shared logic for handling a pasted GraphQL/API JSON blob, whether it
+    arrived by chat message or via the web paste page."""
+    user_data[url_key] = {"raw_json": raw_text, "is_raw": True}
+    img_c = max(raw_text.count('"display_url"'), raw_text.count('"image_versions2"'), raw_text.count('"display_resources"'))
+    vid_c = max(raw_text.count('"video_url"'), raw_text.count('"video_versions"'), raw_text.count('"video_resources"'))
+    if vid_c > 0 and img_c >= vid_c: img_c -= vid_c
+    if img_c == 0 and vid_c == 0: img_c, vid_c = 1, 1
+    await msg.edit_text(
+        f"📊 **Instagram Layout Data Parsed**\nFound {img_c} photos and {vid_c} videos.",
+        reply_markup=build_dynamic_instagram_keyboard(url_key, img_c, vid_c), parse_mode="Markdown"
+    )
+
+async def launch_paste_listener(msg, url_key: str, user_data: dict) -> None:
+    """Background task: waits for the user to submit JSON via the web paste
+    page, then processes it automatically — no need to come back and paste
+    into chat manually."""
+    raw_text = await wait_for_pasted_json(url_key)
+    if not raw_text:
+        try:
+            await msg.edit_text("⌛ Paste link expired — send the URL again to retry.")
+        except Exception:
+            pass
+        return
+    try:
+        await process_pasted_instagram_json(msg, url_key, user_data, raw_text)
+    except Exception as e:
+        try:
+            await msg.edit_text(f"❌ Failed to parse pasted data: {e}")
+        except Exception:
+            pass
+
 async def send_photos(message, files: list[Path]) -> None:
     if not files: return
     if len(files) == 1:
@@ -595,13 +748,7 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if text.startswith("{") and ("xdt_api" in text or "shortcode_media" in text or '"data"' in text or "items" in text):
         msg = await update.message.reply_text("⚙️ Analyzing Layout Blueprint...")
         url_key = str(msg.message_id)
-        ctx.user_data[url_key] = {"raw_json": text, "is_raw": True}
-        img_c = max(text.count('"display_url"'), text.count('"image_versions2"'))
-        vid_c = max(text.count('"video_url"'), text.count('"video_versions"'))
-        if vid_c > 0 and img_c >= vid_c: img_c -= vid_c
-        if img_c == 0 and vid_c == 0: img_c, vid_c = 1, 1
-        await msg.edit_text(f"📊 **Instagram Layout Data Parsed**\nFound {img_c} photos and {vid_c} videos.",
-                            reply_markup=build_dynamic_instagram_keyboard(url_key, img_c, vid_c), parse_mode="Markdown")
+        await process_pasted_instagram_json(msg, url_key, ctx.user_data, text)
         return
 
     url = extract_url(text)
@@ -651,7 +798,7 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # ── Stories: try automatic yt-dlp download first ──────────────────────
         if is_instagram_story_url(url):
             await msg.edit_text("👻 Attempting automatic Story download...")
-            story_files = await asyncio.get_event_loop().run_in_executor(
+            story_files, story_error = await asyncio.get_event_loop().run_in_executor(
                 None, fetch_instagram_stories, url, url_key
             )
             if story_files:
@@ -693,28 +840,43 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     parse_mode="Markdown"
                 )
                 return
-            # Auto-download failed — fall through to manual paste instructions
-            instructions = (
-                "👻 **Instagram Story Detected**\n\n"
-                "Automatic download failed (stories require a logged-in session).\n\n"
-                "**Manual steps:**\n"
-                "1. Open the Story in your browser and press **F12** → Network tab.\n"
-                "2. Filter requests by `reels_media` or `graphql`.\n"
-                "3. Refresh (**Ctrl+R**), then copy the full **Response** of the matching request.\n"
-                "4. **Paste or upload that JSON text** directly into this chat."
-            )
+            # Auto-download failed — fall back to the GraphQL link + paste page
+            api_url, _ = get_instagram_graphql_instructions(url)
+            paste_url = generate_paste_link(url_key)
+            if api_url:
+                instructions = (
+                    "👻 **Instagram Story Detected**\n\n"
+                    f"Automatic download failed ({story_error or 'stories need a logged-in session'}).\n\n"
+                    "**Steps:**\n"
+                    f"1. Open this link: [Story GraphQL Data]({api_url})\n"
+                    "   — open it in a browser where *you're* logged into an account "
+                    "that already has access to this story (if it's private, an account following them).\n"
+                    "2. Select all and copy the page contents.\n"
+                    f"3. Paste it in the [web paste page]({paste_url}) — works on mobile — "
+                    "and it'll continue automatically. (Pasting directly into this chat still works too.)"
+                )
+                asyncio.create_task(launch_paste_listener(msg, url_key, ctx.user_data))
+            else:
+                instructions = (
+                    "👻 **Instagram Story Detected**\n\n"
+                    "Couldn't resolve this account to build a data link — it may not exist "
+                    "or Instagram is rate-limiting lookups right now. Try again shortly."
+                )
             await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
             return
 
         # ── Non-story private/rate-limited fallback ────────────────────────────
         api_url, _ = get_instagram_graphql_instructions(url)
+        paste_url = generate_paste_link(url_key)
         instructions = (
             "🔒 **Private Instagram Post Detected**\n\n"
             "Direct fetch didn't work — this post is likely private or rate-limited.\n\n"
             f"1. Open this link: [GraphQL Payload]({api_url})\n"
             "2. Select all text and copy (**Ctrl+A**, **Ctrl+C**).\n"
-            "3. **Paste or upload the text** right here in this chat stream."
+            f"3. Paste it in the [web paste page]({paste_url}) — works on mobile — "
+            "and it'll continue automatically. (Pasting directly into this chat still works too.)"
         )
+        asyncio.create_task(launch_paste_listener(msg, url_key, ctx.user_data))
         await msg.edit_text(instructions, parse_mode="Markdown", disable_web_page_preview=True)
         return
         
