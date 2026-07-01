@@ -264,21 +264,21 @@ def clean_errors(stderr: str) -> str:
 def is_tiktok_photo_url(url: str) -> bool:
     return "tiktok.com" in url.lower() and "/photo/" in url.lower()
 
-def fetch_instagram_public(url: str, url_key: str) -> list[Path] | None:
+def fetch_instagram_public(url: str, url_key: str) -> tuple[list[Path] | None, str]:
     """
     Fetch a public Instagram post via the i.instagram.com media info API.
-    Uses the iPhone user-agent path which returns full media JSON without auth
-    for public posts. Returns list of Paths on success, None on failure.
+    Returns (files_or_None, error_reason) — error_reason is only meaningful
+    when files is None, so the caller can log/show why it failed instead of
+    silently moving on.
     """
     import urllib.request as _req
+    import http.cookiejar
 
     match = re.search(r"instagram\.com/(?:p|reel|tv|share/v)/([^/?#&]+)", url)
     if not match:
-        return None
+        return None, "Couldn't parse a shortcode out of that URL."
     shortcode = match.group(1)
 
-    # The i.instagram.com/api/v1/media/shortcode/web_info/ endpoint returns
-    # full media JSON for public posts without requiring a login session.
     api_url = f"https://i.instagram.com/api/v1/media/shortcode/web_info/?shortcode={shortcode}&include_reel=false"
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -290,20 +290,36 @@ def fetch_instagram_public(url: str, url_key: str) -> list[Path] | None:
         "Referer": "https://www.instagram.com/",
     }
 
+    # Instagram increasingly rate-limits/blocks fully anonymous requests from
+    # cloud-hosted IPs (like Render's) — attaching the bot's own session
+    # cookies, if configured, makes this look like a normal logged-in browser.
+    opener = _req.build_opener()
+    cookies = get_cookies_path()
+    if cookies:
+        try:
+            jar = http.cookiejar.MozillaCookieJar(str(cookies))
+            jar.load(ignore_discard=True, ignore_expires=True)
+            opener = _req.build_opener(_req.HTTPCookieProcessor(jar))
+        except Exception as e:
+            print(f"⚠️ IG cookie jar load failed for public-post fetch: {e}")
+
     try:
         req = _req.Request(api_url, headers=headers)
-        with _req.urlopen(req, timeout=15) as resp:
+        with opener.open(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
-    except Exception:
-        return None
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        print(f"⚠️ IG web_info lookup failed for shortcode '{shortcode}': {error}")
+        return None, error
 
-    # Response shape: {"items": [{...media...}]}
-    # Wrap it so parse_and_download_instagram can handle it
     try:
         raw_json = json.dumps(data)
-        return parse_and_download_instagram(raw_json, url_key, "all", is_raw_json=True)
-    except Exception:
-        return None
+        files = parse_and_download_instagram(raw_json, url_key, "all", is_raw_json=True)
+        if files:
+            return files, ""
+        return None, "API responded but no media items could be parsed out of it."
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def is_instagram_story_url(url: str) -> bool:
@@ -468,7 +484,7 @@ def get_instagram_graphql_instructions(url: str) -> tuple[str | None, bool, str]
     shortcode = match.group(1)
 
     # Try to scrape a live doc_id from the post page
-    doc_id = "8845758582119845"  # fallback
+    doc_id = "24368985919464652"  # fallback
     try:
         page_url = f"https://www.instagram.com/p/{shortcode}/"
         req = _req.Request(page_url, headers={
@@ -802,8 +818,9 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data[url_key] = {"url": url, "is_raw": False}
 
         # Try direct fetch first (works for public posts without any manual steps)
+        fetch_error = ""
         if not is_instagram_story_url(url):
-            files = await asyncio.get_event_loop().run_in_executor(
+            files, fetch_error = await asyncio.get_event_loop().run_in_executor(
                 None, fetch_instagram_public, url, url_key
             )
             if files:
@@ -816,10 +833,10 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                         reply_markup=build_photo_picker(url_key, len(images))
                     )
                 elif videos and not images:
-                    # single video — go straight to quality picker via normal probe path
+                    # single video — discard the raw-JSON copy and try the normal
+                    # yt-dlp probe path instead, so the user gets a quality picker
                     for f in files:
                         f.unlink(missing_ok=True)
-                    # fall through to probe_url below by clearing files
                     files = None
                 else:
                     # mixed carousel
@@ -834,6 +851,36 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     return
                 if files:
                     return
+
+            # The web_info API either failed or (for single videos) we
+            # deliberately want the quality picker — try yt-dlp's own
+            # Instagram extractor next, same as every other supported site.
+            try:
+                info = await asyncio.get_event_loop().run_in_executor(None, probe_url, url)
+                if is_image_post(info):
+                    img_files = await asyncio.get_event_loop().run_in_executor(None, download_images, url, url_key)
+                    if img_files:
+                        ctx.user_data[url_key] = {"files": [str(p) for p in img_files]}
+                        await msg.edit_text(
+                            f"🖼 Found {len(img_files)} photo(s):",
+                            reply_markup=build_photo_picker(url_key, len(img_files))
+                        )
+                        return
+                else:
+                    heights = get_available_heights(info)
+                    ctx.user_data[url_key] = {
+                        "url": url, "type": "video",
+                        "presets": [fmt for (_label, h_int, fmt) in QUALITY_PRESETS if any(hv <= h_int for hv in heights)]
+                    }
+                    await msg.edit_text(
+                        "📺 *Instagram* stream targeted. Select output layout profiles:",
+                        reply_markup=build_video_keyboard(url_key, heights), parse_mode="Markdown"
+                    )
+                    return
+            except Exception as e:
+                print(f"⚠️ yt-dlp Instagram probe also failed for {url}: {clean_errors(str(e))}")
+                if not fetch_error:
+                    fetch_error = clean_errors(str(e))
 
         # ── Stories: try automatic yt-dlp download first ──────────────────────
         if is_instagram_story_url(url):
@@ -907,9 +954,10 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # ── Non-story private/rate-limited fallback ────────────────────────────
         api_url, _, _ = get_instagram_graphql_instructions(url)
         paste_url = generate_paste_link(url_key)
+        reason_line = f"`{fetch_error}`" if fetch_error else "this post is likely private or rate-limited."
         instructions = (
-            "🔒 **Private Instagram Post Detected**\n\n"
-            "Direct fetch didn't work — this post is likely private or rate-limited.\n\n"
+            "🔒 **Private/Blocked Instagram Post**\n\n"
+            f"Automatic fetch failed: {reason_line}\n\n"
             f"1. Open this link: [GraphQL Payload]({api_url})\n"
             "2. Select all text and copy (**Ctrl+A**, **Ctrl+C**).\n"
             f"3. Paste it in the [web paste page]({paste_url}) — works on mobile — "
