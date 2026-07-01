@@ -74,8 +74,50 @@ def get_cookies_path() -> Path | None:
 
 # ── Health-check & File Server ────────────────────────────────────────────────
 
+PASTE_PAGE_HTML = """<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paste JSON</title>
+<style>
+body{font-family:-apple-system,sans-serif;background:#111;color:#eee;padding:16px;margin:0}
+h3{font-size:16px}
+textarea{width:100%;height:55vh;box-sizing:border-box;background:#1c1c1c;color:#eee;
+  border:1px solid #444;border-radius:8px;padding:10px;font-size:14px}
+button{width:100%;padding:14px;margin-top:12px;font-size:16px;border:none;border-radius:8px;
+  background:#2ea6ff;color:#fff}
+#status{margin-top:12px;text-align:center;font-size:15px}
+</style></head>
+<body>
+<h3>Paste the copied JSON response below, then submit</h3>
+<textarea id="j" placeholder="Long-press → Paste here..."></textarea>
+<button onclick="submitIt()">Submit to bot</button>
+<div id="status"></div>
+<script>
+async function submitIt(){
+  const v = document.getElementById('j').value;
+  const s = document.getElementById('status');
+  s.textContent = 'Sending...';
+  try {
+    const r = await fetch('/submit/__KEY__', {method:'POST', body: v});
+    s.textContent = r.ok ? '✅ Sent! You can go back to Telegram now.' : '❌ Failed, try again.';
+  } catch (e) {
+    s.textContent = '❌ Failed, try again.';
+  }
+}
+</script>
+</body></html>"""
+
 class CombinedServerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/paste/"):
+            key = urllib.parse.unquote(self.path.split("/paste/", 1)[1]).strip("/")
+            key = re.sub(r"[^A-Za-z0-9_\-]", "", key)
+            body = PASTE_PAGE_HTML.replace("__KEY__", key).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path.startswith("/download/"):
             try:
                 filename = urllib.parse.unquote(self.path.split("/download/", 1)[1])
@@ -97,11 +139,38 @@ class CombinedServerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
 
+    def do_POST(self):
+        if self.path.startswith("/submit/"):
+            key = urllib.parse.unquote(self.path.split("/submit/", 1)[1]).strip("/")
+            key = re.sub(r"[^A-Za-z0-9_\-]", "", key)
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body_text = self.rfile.read(length).decode("utf-8", errors="ignore")
+            except Exception:
+                body_text = ""
+            ok = bool(key) and bool(body_text.strip())
+            if ok:
+                try:
+                    (DOWNLOAD_DIR / f"paste_{key}.json").write_text(body_text, encoding="utf-8")
+                except Exception:
+                    ok = False
+            resp = b"OK" if ok else b"EMPTY"
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+        self.send_error(404, "Not Found")
+
     def log_message(self, *args):
         pass
 
+class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
 def run_health_server():
-    HTTPServer(("0.0.0.0", PORT), CombinedServerHandler).serve_forever()
+    _ThreadingHTTPServer(("0.0.0.0", PORT), CombinedServerHandler).serve_forever()
 
 # ── Extraction helpers ─────────────────────────────────────────────────────────
 
@@ -694,6 +763,7 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 return
             # Auto-download failed — fall through to manual paste instructions
+            paste_url = generate_paste_link(url_key)
             instructions = (
                 "👻 **Instagram Story Detected**\n\n"
                 "Automatic download failed (stories require a logged-in session).\n\n"
@@ -708,6 +778,7 @@ async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         # ── Non-story private/rate-limited fallback ────────────────────────────
         api_url, _ = get_instagram_graphql_instructions(url)
+        paste_url = generate_paste_link(url_key)
         instructions = (
             "🔒 **Private Instagram Post Detected**\n\n"
             "Direct fetch didn't work — this post is likely private or rate-limited.\n\n"
